@@ -103,6 +103,8 @@ export interface ChannelBinding {
   mode: 'code' | 'plan' | 'ask';
   /** Whether this binding is currently active */
   active: boolean;
+  /** Fixed-session recovery handshake state. Persisted with the binding. */
+  recoveryState?: 'pending' | 'armed';
   createdAt: string;
   updatedAt: string;
 }

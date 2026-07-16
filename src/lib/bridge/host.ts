@@ -35,6 +35,7 @@ export type SSEEventType =
   | 'status'
   | 'result'
   | 'error'
+  | 'recovery_required'
   | 'permission_request'
   | 'mode_changed'
   | 'task_update'
@@ -215,6 +216,10 @@ export interface StreamChatParams {
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   files?: FileAttachment[];
   onRuntimeStatusChange?: (status: string) => void;
+  /** Explicit opt-in to fail-closed resume recovery. */
+  sessionPolicy?: 'fixed-confirm-recovery';
+  /** One-shot authorization to ignore a stale SDK thread and start fresh. */
+  forceFreshThread?: boolean;
 }
 
 export interface LLMProvider {
@@ -249,4 +254,10 @@ export interface LifecycleHooks {
   onBridgeStart?(): void;
   /** Called when the bridge system stops. */
   onBridgeStop?(): void;
+  /** Report external-link transitions without raw errors or platform identifiers. */
+  onExternalHealth?(event: ExternalHealthEvent): void;
 }
+
+export type ExternalHealthEvent =
+  | { component: 'feishu'; state: 'connected' | 'disconnected' | 'accepted-inbound' }
+  | { component: 'codex'; state: 'success' | 'error' };

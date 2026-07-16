@@ -54,6 +54,8 @@ export interface ConversationResult {
   permissionRequests: PermissionRequestInfo[];
   /** SDK session ID captured from status/result events, for session resume */
   sdkSessionId: string | null;
+  /** Provider could not resume and requires the fixed-session confirmation flow. */
+  recoveryRequired: boolean;
 }
 
 /**
@@ -68,6 +70,7 @@ export async function processMessage(
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  forceFreshThread = false,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
@@ -83,6 +86,7 @@ export async function processMessage(
       errorMessage: 'Session is busy processing another request',
       permissionRequests: [],
       sdkSessionId: null,
+      recoveryRequired: false,
     };
   }
 
@@ -179,12 +183,32 @@ export async function processMessage(
       onRuntimeStatusChange: (status: string) => {
         try { store.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },
+      sessionPolicy: store.getSetting('bridge_session_policy') === 'fixed-confirm-recovery'
+        ? 'fixed-confirm-recovery'
+        : undefined,
+      forceFreshThread,
     });
 
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+    const result = await consumeStream(
+      stream,
+      sessionId,
+      onPermissionRequest,
+      onPartialText,
+      onToolEvent,
+      store.getSetting('bridge_session_policy') === 'fixed-confirm-recovery',
+    );
+    if (store.getSetting('bridge_runtime') === 'codex') {
+      try {
+        getBridgeContext().lifecycle.onExternalHealth?.({
+          component: 'codex',
+          state: result.hasError ? 'error' : 'success',
+        });
+      } catch { /* health reporting must not affect the conversation */ }
+    }
+    return result;
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -202,6 +226,7 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  deferSdkPersistence = false,
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -215,6 +240,7 @@ async function consumeStream(
   const seenToolResultIds = new Set<string>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
+  let recoveryRequired = false;
 
   try {
     while (true) {
@@ -318,7 +344,7 @@ async function consumeStream(
               const statusData = JSON.parse(event.data);
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
-                store.updateSdkSessionId(sessionId, statusData.session_id);
+                if (!deferSdkPersistence) store.updateSdkSessionId(sessionId, statusData.session_id);
               }
               if (statusData.model) {
                 store.updateSessionModel(sessionId, statusData.model);
@@ -342,6 +368,12 @@ async function consumeStream(
             errorMessage = event.data || 'Unknown error';
             break;
 
+          case 'recovery_required':
+            hasError = true;
+            recoveryRequired = true;
+            errorMessage = 'The previous Codex session could not be resumed. Send @bot /recover confirm to authorize one replacement attempt.';
+            break;
+
           case 'result': {
             try {
               const resultData = JSON.parse(event.data);
@@ -349,7 +381,7 @@ async function consumeStream(
               if (resultData.is_error) hasError = true;
               if (resultData.session_id) {
                 capturedSdkSessionId = resultData.session_id;
-                store.updateSdkSessionId(sessionId, resultData.session_id);
+                if (!deferSdkPersistence) store.updateSdkSessionId(sessionId, resultData.session_id);
               }
             } catch { /* skip */ }
             break;
@@ -397,6 +429,7 @@ async function consumeStream(
       errorMessage,
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      recoveryRequired,
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -429,6 +462,7 @@ async function consumeStream(
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      recoveryRequired,
     };
   }
 }

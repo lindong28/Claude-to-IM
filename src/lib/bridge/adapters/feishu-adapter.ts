@@ -64,6 +64,50 @@ interface FeishuCardState {
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
 
+/** Irreversible identifier correlation for logs; never emit platform IDs. */
+function correlationRef(...values: string[]): string {
+  return crypto.createHash('sha256').update(values.join('\0')).digest('hex').slice(0, 12);
+}
+
+function formatBotStartupLog(botOpenId: string | null): string {
+  return `[feishu-adapter] Started (botOpenId: ${
+    botOpenId ? `resolved ref=${correlationRef(botOpenId)}` : 'unknown'
+  })`;
+}
+
+function reportFeishuHealth(state: 'connected' | 'disconnected' | 'accepted-inbound'): void {
+  try {
+    getBridgeContext().lifecycle.onExternalHealth?.({ component: 'feishu', state });
+  } catch { /* health reporting must not affect message delivery */ }
+}
+
+function createWsHealthLogger(report: (state: 'connected' | 'disconnected') => void) {
+  const inspect = (level: 'error' | 'warn' | 'info' | 'debug' | 'trace', args: unknown[]) => {
+    const values = args.flatMap((value) => Array.isArray(value) ? value : [value]);
+    const text = values.filter((value): value is string => typeof value === 'string').join(' ');
+    if (level === 'debug' && (text.includes('ws connect success') || text.includes('reconnect success'))) {
+      report('connected');
+    } else if (
+      (level === 'debug' && text.includes('client closed'))
+      || (level === 'info' && text.includes('ws client closed manually'))
+      || (level === 'error' && (
+        text.includes('ws connect failed')
+        || text.includes('connect failed')
+        || text.includes('ws error')
+      ))
+    ) {
+      report('disconnected');
+    }
+  };
+  return {
+    error: (...args: unknown[]) => inspect('error', args),
+    warn: (...args: unknown[]) => inspect('warn', args),
+    info: (...args: unknown[]) => inspect('info', args),
+    debug: (...args: unknown[]) => inspect('debug', args),
+    trace: (...args: unknown[]) => inspect('trace', args),
+  };
+}
+
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
   sender: {
@@ -166,6 +210,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       appId,
       appSecret,
       domain,
+      loggerLevel: lark.LoggerLevel.debug,
+      logger: createWsHealthLogger((state) => reportFeishuHealth(state)),
     });
 
     // Monkey-patch WSClient.handleEventData to support card action events (type: "card").
@@ -192,7 +238,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     this.wsClient.start({ eventDispatcher: dispatcher });
 
-    console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
+    console.log(formatBotStartupLog(this.botOpenId));
   }
 
   async stop(): Promise<void> {
@@ -329,6 +375,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const userId = event?.operator?.open_id || event?.open_id || '';
 
       if (!chatId) return FALLBACK_TOAST;
+      if (!this.isAuthorizedContext(userId, chatId)) {
+        console.warn(`[feishu-adapter] Unauthorized card action (ref=${correlationRef(userId, chatId)})`);
+        return FALLBACK_TOAST;
+      }
 
       const callbackMsg: import('../types.js').InboundMessage = {
         messageId: messageId || `card_action_${Date.now()}`,
@@ -342,6 +392,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         callbackData,
         callbackMessageId: messageId,
       };
+      reportFeishuHealth('accepted-inbound');
       this.enqueue(callbackMsg);
 
       return { toast: { type: 'info' as const, content: '已收到，正在处理...' } };
@@ -881,6 +932,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret');
     if (!appSecret) return 'bridge_feishu_app_secret not configured';
 
+    const policy = getBridgeContext().store.getSetting('bridge_feishu_group_policy');
+    if (policy && !['open', 'allowlist', 'disabled'].includes(policy)) {
+      return 'bridge_feishu_group_policy must be open, allowlist, or disabled';
+    }
+    const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention');
+    if (requireMention && !['true', 'false'].includes(requireMention)) {
+      return 'bridge_feishu_require_mention must be true or false';
+    }
+    if (policy === 'allowlist') {
+      if (!(getBridgeContext().store.getSetting('bridge_feishu_allowed_users') || '').trim()) {
+        return 'bridge_feishu_allowed_users required for allowlist policy';
+      }
+      if (!(getBridgeContext().store.getSetting('bridge_feishu_group_allow_from') || '').trim()) {
+        return 'bridge_feishu_group_allow_from required for allowlist policy';
+      }
+    }
+
     return null;
   }
 
@@ -898,7 +966,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     if (allowed.length === 0) return true;
 
+    if (getBridgeContext().store.getSetting('bridge_feishu_group_policy') === 'allowlist') {
+      return allowed.includes(userId);
+    }
     return allowed.includes(userId) || allowed.includes(chatId);
+  }
+
+  private isAuthorizedContext(userId: string, chatId: string): boolean {
+    if (!this.isAuthorized(userId, chatId)) return false;
+    if (getBridgeContext().store.getSetting('bridge_feishu_group_policy') !== 'allowlist') return true;
+    return (getBridgeContext().store.getSetting('bridge_feishu_group_allow_from') || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .includes(chatId);
   }
 
   // ── Incoming event handler ──────────────────────────────────
@@ -934,8 +1015,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const isGroup = msg.chat_type === 'group';
 
     // Authorization check
-    if (!this.isAuthorized(userId, chatId)) {
-      console.warn('[feishu-adapter] Unauthorized message from userId:', userId, 'chatId:', chatId);
+    if (!(isGroup ? this.isAuthorizedContext(userId, chatId) : this.isAuthorized(userId, chatId))) {
+      console.warn(`[feishu-adapter] Unauthorized message (ref=${correlationRef(userId, chatId)})`);
       return;
     }
 
@@ -944,7 +1025,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const policy = getBridgeContext().store.getSetting('bridge_feishu_group_policy') || 'open';
 
       if (policy === 'disabled') {
-        console.log('[feishu-adapter] Group message ignored (policy=disabled), chatId:', chatId);
+        console.log(`[feishu-adapter] Group message ignored (policy=disabled, ref=${correlationRef(chatId)})`);
         return;
       }
 
@@ -954,7 +1035,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           .map((s) => s.trim())
           .filter(Boolean);
         if (!allowedGroups.includes(chatId)) {
-          console.log('[feishu-adapter] Group message ignored (not in allowlist), chatId:', chatId);
+          console.log(`[feishu-adapter] Group message ignored (not in allowlist, ref=${correlationRef(chatId)})`);
           return;
         }
       }
@@ -962,7 +1043,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
       if (requireMention && !this.isBotMentioned(msg.mentions)) {
-        console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
+        console.log(`[feishu-adapter] Group message ignored (bot not @mentioned, ref=${correlationRef(chatId)})`);
         try {
           getBridgeContext().store.insertAuditLog({
             channelType: 'feishu',
@@ -1077,6 +1158,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           timestamp,
           callbackData,
         };
+        reportFeishuHealth('accepted-inbound');
         this.enqueue(inbound);
         return;
       }
@@ -1104,6 +1186,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       });
     } catch { /* best effort */ }
 
+    reportFeishuHealth('accepted-inbound');
     this.enqueue(inbound);
   }
 
@@ -1362,6 +1445,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 }
+
+export const _testOnly = {
+  createWsHealthLogger: (report: (event: { component: 'feishu'; state: 'connected' | 'disconnected' }) => void) =>
+    createWsHealthLogger((state) => report({ component: 'feishu', state })),
+  formatBotStartupLog,
+};
 
 // Self-register so bridge-manager can create FeishuAdapter via the registry.
 registerAdapterFactory('feishu', () => new FeishuAdapter());

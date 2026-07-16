@@ -21,6 +21,8 @@ Each adapter implements `isAuthorized(userId, chatId)`:
 
 Unauthorized messages are silently dropped (no response leak).
 
+For a fixed Feishu group deployment, require all three controls together: non-empty allowed users, group policy `allowlist` with non-empty allowed groups, and mention-required. Apply the same user/group authorization to message events and card callbacks.
+
 ### Input Validation (`security/validators.ts`)
 
 - `validateWorkingDirectory()`: Rejects relative paths, `..` traversal, shell metacharacters (`|;&$`)
@@ -39,12 +41,20 @@ Token bucket algorithm: 20 messages/minute per chat ID. Idle buckets cleaned up 
 - **Atomic dedup**: `markPermissionLinkResolved()` uses atomic check-and-set to prevent race conditions from concurrent button clicks
 - **In-memory dedup**: `recentPermissionForwards` map prevents duplicate forwarding (30s window)
 
+Codex approval policy `never` is non-interactive: no permission request/card is generated, and Feishu `card.action.trigger` is unnecessary. Do not add a callback or auto-approve setting to simulate a permission flow; sandbox configuration is the authorization boundary.
+
+### Fixed Session Recovery
+
+`fixed-confirm-recovery` fails closed on explicit resume failure. Recovery confirmation is scoped to the same authorized channel/chat and only arms the next ordinary message; confirmation itself performs no provider call. Persistence must succeed before recovery is acknowledged or a replacement thread becomes authoritative.
+
 ### Audit Logging
 
 All inbound and outbound messages are logged via `store.insertAuditLog()` with:
 - Channel type, chat ID, direction, message ID, truncated summary
 - Dangerous input blocks are logged with `[BLOCKED]` prefix
 - Truncated inputs are logged with `[TRUNCATED]` prefix
+
+Host-side Codex call-envelope/rollout evidence is private operational data and needs an explicit retention policy; the bridge does not prune it automatically. Missing, ambiguous, replaced/rotated, shortened, or unparsable rollout evidence is audit-unavailable and cannot establish same-condition retry eligibility. Checkpoint comparison cannot detect the extreme case where the same inode is truncated and regrown beyond its old byte size; treat evidence with that possibility as untrusted.
 
 ### Transport Security
 

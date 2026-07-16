@@ -105,6 +105,15 @@ All settings are read via `BridgeStore.getSetting(key)`. Key settings:
 - `bridge_{adapter}_bot_token` — bot credentials
 - `bridge_{adapter}_allowed_users` — CSV of authorized user IDs
 - `bridge_{adapter}_stream_enabled` — streaming preview toggle
+- `bridge_feishu_group_policy=allowlist` + `bridge_feishu_group_allow_from` — fail-closed Feishu group access
+- `bridge_feishu_require_mention=true` — require the bot mention in an allowed group
+- `bridge_session_policy=fixed-confirm-recovery` — keep one thread per chat and require explicit same-chat recovery confirmation
+
+### Fixed session recovery
+
+Under `fixed-confirm-recovery`, `/cwd`, `/new`, and `/bind` are disabled. An explicit provider resume failure marks only that binding as recovery-pending; ordinary messages make no provider call. An authorized user in the same chat sends `@bot /recover confirm` to arm recovery. The next ordinary message atomically consumes the authorization, starts one fresh thread, and persists the replacement binding. The confirm command itself never calls the provider.
+
+Hosts that set Codex approval policy to `never` must not imply an interactive permission flow: Codex produces no permission request, Feishu sends no permission card, and `card.action.trigger` is not required for that deployment. The sandbox remains the enforcement boundary.
 
 ## Security
 

@@ -20,6 +20,7 @@ import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
+import crypto from 'node:crypto';
 import {
   validateWorkingDirectory,
   validateSessionId,
@@ -29,6 +30,11 @@ import {
 } from './security/validators.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
+const RECOVERY_PERSISTENCE_ERROR = 'Recovery state could not be saved. Please retry.';
+
+function correlationRef(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -574,7 +580,7 @@ async function handleMessage(
   // Sanitize general message text before routing to conversation engine
   const { text, truncated } = sanitizeInput(rawText);
   if (truncated) {
-    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
+    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars (ref=${correlationRef(msg.address.chatId)})`);
     store.insertAuditLog({
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
@@ -588,6 +594,36 @@ async function handleMessage(
 
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
+  const fixedSessionPolicy = store.getSetting('bridge_session_policy') === 'fixed-confirm-recovery';
+  const recoveryAttempt = fixedSessionPolicy && binding.recoveryState === 'armed';
+
+  if (fixedSessionPolicy && binding.recoveryState === 'pending') {
+    await deliver(adapter, {
+      address: msg.address,
+      text: 'Recovery confirmation is required. Send @bot /recover confirm first.',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    ack();
+    return;
+  }
+
+  // Atomically consume the one-shot authorization before any provider side effect.
+  // A crash or later persistence failure therefore requires confirmation again.
+  if (recoveryAttempt && binding.id) {
+    try {
+      store.updateChannelBinding(binding.id, { recoveryState: 'pending' });
+    } catch {
+      await deliver(adapter, {
+        address: msg.address,
+        text: RECOVERY_PERSISTENCE_ERROR,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+  }
 
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
@@ -706,7 +742,44 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, recoveryAttempt);
+
+    // Persist recovery/session state before acknowledging the result externally.
+    // This keeps the confirmation flow durable if delivery succeeds immediately
+    // before the process exits.
+    let recoveryPersistenceFailed = false;
+    if (binding.id) {
+      try {
+        if (fixedSessionPolicy) {
+          if (result.recoveryRequired) {
+            store.updateChannelBinding(binding.id, { recoveryState: 'pending' });
+          } else if (recoveryAttempt) {
+            if (!result.hasError && result.sdkSessionId) {
+              store.updateChannelBinding(binding.id, {
+                sdkSessionId: result.sdkSessionId,
+                recoveryState: undefined,
+              });
+            }
+          } else if (result.sdkSessionId && !result.hasError) {
+            store.updateChannelBinding(binding.id, { sdkSessionId: result.sdkSessionId });
+          }
+        } else {
+          const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+          if (update !== null) {
+            store.updateChannelBinding(binding.id, { sdkSessionId: update });
+          }
+        }
+      } catch {
+        recoveryPersistenceFailed = fixedSessionPolicy
+          && (result.recoveryRequired || recoveryAttempt);
+      }
+    }
+
+    const responseText = recoveryPersistenceFailed
+      ? RECOVERY_PERSISTENCE_ERROR
+      : recoveryAttempt && !result.hasError
+      ? `Replacement session created.\n\n${result.responseText}`.trim()
+      : result.responseText;
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -714,8 +787,8 @@ async function handleMessage(
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
       try {
-        const status = result.hasError ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
+        const status = result.hasError || recoveryPersistenceFailed ? 'error' : 'completed';
+        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, responseText);
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
       }
@@ -723,9 +796,9 @@ async function handleMessage(
 
     // Send response text — render via channel-appropriate format.
     // Skip if streaming card was finalized (content already in card).
-    if (result.responseText) {
+    if (responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        await deliverResponse(adapter, msg.address, responseText, binding.codepilotSessionId, msg.messageId);
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -737,17 +810,6 @@ async function handleMessage(
       await deliver(adapter, errorResponse);
     }
 
-    // Persist the actual SDK session ID for future resume.
-    // If the result has an error and no session ID was captured, clear the
-    // stale ID so the next message starts fresh instead of retrying a broken resume.
-    if (binding.id) {
-      try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
-        if (update !== null) {
-          store.updateChannelBinding(binding.id, { sdkSessionId: update });
-        }
-      } catch { /* best effort */ }
-    }
   } finally {
     // Clean up preview state
     if (previewState) {
@@ -788,6 +850,17 @@ async function handleCommand(
   const command = parts[0].split('@')[0].toLowerCase();
   const args = parts.slice(1).join(' ').trim();
 
+  const fixedSessionPolicy = store.getSetting('bridge_session_policy') === 'fixed-confirm-recovery';
+  if (fixedSessionPolicy && ['/cwd', '/new', '/bind'].includes(command)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: 'Command rejected: this bridge uses a fixed session policy.',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+
   // Run dangerous-input detection on the full command text
   const dangerCheck = isDangerousInput(text);
   if (dangerCheck.dangerous) {
@@ -798,7 +871,7 @@ async function handleCommand(
       messageId: msg.messageId,
       summary: `[BLOCKED] Dangerous input detected: ${dangerCheck.reason}`,
     });
-    console.warn(`[bridge-manager] Blocked dangerous command input from chat ${msg.address.chatId}: ${dangerCheck.reason}`);
+    console.warn(`[bridge-manager] Blocked dangerous command input (ref=${correlationRef(msg.address.chatId)}): ${dangerCheck.reason}`);
     await deliver(adapter, {
       address: msg.address,
       text: `Command rejected: invalid input detected.`,
@@ -961,6 +1034,25 @@ async function handleCommand(
       break;
     }
 
+    case '/recover': {
+      if (!fixedSessionPolicy || args !== 'confirm') {
+        response = 'Usage: /recover confirm';
+        break;
+      }
+      const binding = store.getChannelBinding(adapter.channelType, msg.address.chatId);
+      if (!binding || binding.recoveryState !== 'pending' || !isAuthorizedRecovery(msg)) {
+        response = 'No recovery confirmation is pending for this authorized chat.';
+        break;
+      }
+      try {
+        store.updateChannelBinding(binding.id, { recoveryState: 'armed' });
+        response = 'Recovery confirmed. Your next message will make one replacement session attempt.';
+      } catch {
+        response = RECOVERY_PERSISTENCE_ERROR;
+      }
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
@@ -990,6 +1082,18 @@ async function handleCommand(
       replyToMessageId: msg.messageId,
     });
   }
+}
+
+function splitSetting(value: string | null): string[] {
+  return (value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function isAuthorizedRecovery(msg: InboundMessage): boolean {
+  const { store } = getBridgeContext();
+  if (msg.address.channelType !== 'feishu' || !msg.address.userId) return false;
+  if (store.getSetting('bridge_feishu_group_policy') !== 'allowlist') return false;
+  return splitSetting(store.getSetting('bridge_feishu_allowed_users')).includes(msg.address.userId)
+    && splitSetting(store.getSetting('bridge_feishu_group_allow_from')).includes(msg.address.chatId);
 }
 
 // ── SDK Session Update Logic ─────────────────────────────────
