@@ -10,6 +10,7 @@ import type {
   BridgeStore,
   ExternalHealthEvent,
   LLMProvider,
+  PendingQuestionRecord,
   StreamChatParams,
 } from '../../lib/bridge/host';
 import type {
@@ -388,6 +389,124 @@ await describe('fixed-confirm-recovery session policy', { concurrency: 1 }, () =
     assert.equal(mutableStore.getChannelBinding('feishu', GROUP_A)!.workingDirectory, '/changed');
   });
 
+  it('rejects /mode changes when the independent fixed-mode opt-in is active', async () => {
+    const fixedModeGroup = 'group_fixed_mode_canary';
+    const fixedModeStore = createStore({
+      bridge_default_work_dir: '/fixed',
+      bridge_default_mode: 'code',
+      bridge_fixed_mode: 'code',
+    });
+    initBridgeContext({
+      store: fixedModeStore,
+      llm: { streamChat: () => stream(sse('text', 'ok')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    seedBinding(fixedModeStore, fixedModeGroup);
+    await _testOnly.handleMessage(adapter, inbound(fixedModeGroup, USER_OK, '/mode plan'));
+    assert.equal(fixedModeStore.getChannelBinding('feishu', fixedModeGroup)!.mode, 'code');
+    assert.match(adapter.sent.at(-1)!.text, /fixed.*code/i);
+  });
+
+  it('preserves mutable /mode behavior when fixed mode is not opted in', async () => {
+    const mutableModeGroup = 'group_mutable_mode_canary';
+    const mutableStore = createStore({ bridge_default_work_dir: '/default' });
+    initBridgeContext({
+      store: mutableStore,
+      llm: { streamChat: () => stream(sse('text', 'ok')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    await _testOnly.handleMessage(adapter, inbound(mutableModeGroup, USER_OK, '/mode plan'));
+    assert.equal(mutableStore.getChannelBinding('feishu', mutableModeGroup)!.mode, 'plan');
+  });
+
+  it('dispatches a restart card-answer resume through the session lock without blocking callback consumption', async () => {
+    const restartGroup = 'group_restart_question_canary';
+    const restartStore = createStore({ bridge_default_work_dir: '/fixed' });
+    const binding = seedBinding(restartStore, restartGroup);
+    const pending = new Map<string, PendingQuestionRecord>();
+    pending.set('ask-restart-manager', {
+      questionRequestId: 'ask-restart-manager',
+      channelType: 'feishu',
+      chatId: restartGroup,
+      sessionId: binding.codepilotSessionId,
+      questions: [{
+        question: 'Database?',
+        header: 'Database',
+        options: [
+          { label: 'PostgreSQL', description: 'Relational' },
+          { label: 'MongoDB', description: 'Document' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'sent',
+      generation: 'restart-generation',
+      messageId: 'restart-card',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    restartStore.getPendingQuestion = (id) => pending.get(id) ?? null;
+    restartStore.listPendingQuestions = () => [...pending.values()];
+    restartStore.transitionPendingQuestion = (id, expected, update) => {
+      const current = pending.get(id);
+      if (!current || !expected.includes(current.state)) return false;
+      pending.set(id, { ...current, ...update });
+      return true;
+    };
+
+    let releaseProvider!: () => void;
+    let providerCalls = 0;
+    initBridgeContext({
+      store: restartStore,
+      llm: {
+        streamChat() {
+          providerCalls += 1;
+          return new ReadableStream({
+            start(controller) {
+              releaseProvider = () => {
+                controller.enqueue(sse('text', 'resumed response'));
+                controller.close();
+              };
+            },
+          });
+        },
+      },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion: () => false,
+      },
+      lifecycle: {},
+    });
+
+    const callback = inbound(restartGroup, USER_OK, '');
+    callback.callbackData = 'ask:submit:ask-restart-manager:restart-generation';
+    callback.callbackMessageId = 'restart-card';
+    callback.callbackFormValue = { q_0: 'PostgreSQL' };
+    const callbackHandling = _testOnly.handleMessage(adapter, callback);
+    const dispatchResult = await Promise.race([
+      callbackHandling.then(() => 'returned'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 30)),
+    ]);
+
+    if (dispatchResult === 'blocked') {
+      releaseProvider();
+      await callbackHandling;
+    }
+    assert.equal(dispatchResult, 'returned');
+    assert.equal(providerCalls, 1);
+    const managerState = (globalThis as unknown as {
+      __bridge_manager__: { sessionLocks: Map<string, Promise<void>> };
+    }).__bridge_manager__;
+    assert.equal(managerState.sessionLocks.has(binding.codepilotSessionId), true);
+
+    releaseProvider();
+    await managerState.sessionLocks.get(binding.codepilotSessionId);
+    assert.equal(managerState.sessionLocks.has(binding.codepilotSessionId), false);
+    assert.equal(pending.get('ask-restart-manager')!.state, 'answered');
+  });
+
 });
 
 function feishuEvent(chatId: string, userId: string, messageId: string, topic: string) {
@@ -526,13 +645,17 @@ await describe('Feishu policy normalization and identifier-safe filters', { conc
 
   it('accepts a card action only when both actor and group are allowlisted', async () => {
     await (adapter as any).handleCardAction({
-      action: { value: { callback_data: 'perm:allow:permission-card-canary' } },
+      action: {
+        value: { callback_data: 'ask:submit:question-card-canary:generation-canary' },
+        form_value: { q_0: 'Choice A', other_0: '' },
+      },
       context: { open_chat_id: GROUP_A, open_message_id: 'card-message-canary' },
       operator: { open_id: USER_OK },
     });
     const queued = await adapter.consumeOne();
     assert.equal(queued?.address.chatId, GROUP_A);
     assert.equal(queued?.address.userId, USER_OK);
+    assert.deepEqual(queued?.callbackFormValue, { q_0: 'Choice A', other_0: '' });
     assert.deepEqual(healthEvents, [{ component: 'feishu', state: 'accepted-inbound' }]);
   });
 

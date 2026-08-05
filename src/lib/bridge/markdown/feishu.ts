@@ -1,4 +1,5 @@
 import type { ToolCallInfo } from '../types.js';
+import type { AskQuestion } from '../host.js';
 
 /**
  * Feishu-specific Markdown processing.
@@ -232,6 +233,65 @@ export function buildPermissionButtonCard(
           text_size: 'notation',
         },
       ],
+    },
+  });
+}
+
+/** Build a schema 2.0 form card for the Claude SDK AskUserQuestion tool. */
+export function buildQuestionCard(
+  questions: AskQuestion[],
+  questionRequestId: string,
+  generation: string,
+  chatId?: string,
+): string {
+  const elements: Array<Record<string, unknown>> = [];
+
+  questions.forEach((question, index) => {
+    elements.push({
+      tag: 'markdown',
+      content: `**${question.header}**\n${question.question}`,
+    });
+    elements.push({
+      tag: question.multiSelect ? 'multi_select_static' : 'select_static',
+      name: `q_${index}`,
+      required: true,
+      placeholder: { tag: 'plain_text', content: question.multiSelect ? 'Select one or more' : 'Select one' },
+      options: [
+        ...question.options.map((option) => ({
+          text: { tag: 'plain_text', content: option.label },
+          value: option.label,
+        })),
+        { text: { tag: 'plain_text', content: 'Other' }, value: 'Other' },
+      ],
+    });
+    elements.push({
+      tag: 'input',
+      name: `other_${index}`,
+      required: false,
+      placeholder: { tag: 'plain_text', content: 'If you selected Other, enter your answer' },
+    });
+  });
+
+  elements.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: 'Submit answers' },
+    type: 'primary',
+    action_type: 'form_submit',
+    value: {
+      callback_data: `ask:submit:${questionRequestId}:${generation}`,
+      ...(chatId ? { chatId } : {}),
+    },
+  });
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: 'Question from Claude' },
+      template: 'blue',
+    },
+    body: {
+      elements: [{ tag: 'form', name: 'ask_user_question', elements }],
     },
   });
 }

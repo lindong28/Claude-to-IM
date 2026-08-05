@@ -18,7 +18,14 @@ export function resolve(address: ChannelAddress): ChannelBinding {
   if (existing) {
     // Verify the linked session still exists; if not, create a new one
     const session = store.getSession(existing.codepilotSessionId);
-    if (session) return existing;
+    if (session) {
+      const fixedMode = store.getSetting('bridge_fixed_mode');
+      if (fixedMode && existing.mode !== fixedMode) {
+        store.updateChannelBinding(existing.id, { mode: fixedMode as ChannelBinding['mode'] });
+        return { ...existing, mode: fixedMode as ChannelBinding['mode'] };
+      }
+      return existing;
+    }
     // Session was deleted — recreate
     return createBinding(address);
   }
@@ -38,6 +45,7 @@ export function createBinding(
     || process.env.HOME
     || '';
   const defaultModel = store.getSetting('bridge_default_model') || '';
+  const defaultMode = store.getSetting('bridge_fixed_mode') || 'code';
   const defaultProviderId = store.getSetting('bridge_default_provider_id') || '';
 
   const displayName = address.displayName || address.chatId;
@@ -46,7 +54,7 @@ export function createBinding(
     defaultModel,
     undefined,
     defaultCwd,
-    'code',
+    defaultMode,
   );
 
   if (defaultProviderId) {
@@ -60,7 +68,7 @@ export function createBinding(
     sdkSessionId: '',
     workingDirectory: defaultCwd,
     model: defaultModel,
-    mode: 'code',
+    mode: defaultMode,
   });
 }
 

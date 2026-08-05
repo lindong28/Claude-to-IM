@@ -15,6 +15,7 @@ import './adapters/index.js';
 import * as router from './channel-router.js';
 import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
+import { questionBroker } from './question-broker.js';
 import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
@@ -218,6 +219,15 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
   return current;
 }
 
+function dispatchSessionMessage(adapter: BaseChannelAdapter, msg: InboundMessage): void {
+  const binding = router.resolve(msg.address);
+  processWithSessionLock(binding.codepilotSessionId, () =>
+    handleMessage(adapter, msg),
+  ).catch(err => {
+    console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
+  });
+}
+
 /**
  * Start the bridge system.
  * Checks feature flags, registers enabled adapters, starts polling loops.
@@ -278,6 +288,14 @@ export async function start(): Promise<void> {
   // Notify host that bridge is starting (e.g., suppress competing polling)
   lifecycle.onBridgeStart?.();
 
+  // Re-issue persisted unanswered questions after a daemon restart. Any old
+  // card generation remains invalid, so stale callbacks cannot resolve it.
+  for (const [, adapter] of state.adapters) {
+    if (adapter.isRunning()) {
+      await questionBroker.restorePendingQuestions(adapter);
+    }
+  }
+
   // Now start the consumer loops (state.running is already true)
   for (const [, adapter] of state.adapters) {
     if (adapter.isRunning()) {
@@ -298,6 +316,7 @@ export async function stop(): Promise<void> {
   const { lifecycle } = getBridgeContext();
 
   state.running = false;
+  questionBroker.dispose();
 
   // Abort all event loops
   for (const [, abort] of state.loopAborts) {
@@ -405,14 +424,9 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         ) {
           await handleMessage(adapter, msg);
         } else {
-          const binding = router.resolve(msg.address);
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
-          processWithSessionLock(binding.codepilotSessionId, () =>
-            handleMessage(adapter, msg),
-          ).catch(err => {
-            console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
-          });
+          dispatchSessionMessage(adapter, msg);
         }
       } catch (err) {
         if (abort.signal.aborted) break;
@@ -463,6 +477,42 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
+    const questionResult = questionBroker.handleQuestionCallback(
+      msg.callbackData,
+      msg.address.chatId,
+      msg.callbackMessageId,
+      msg.callbackFormValue || {},
+    );
+    if (questionResult.handled) {
+      if (!questionResult.accepted) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: questionResult.error || 'Question response rejected.',
+          parseMode: 'plain',
+        });
+        ack();
+        return;
+      }
+      if (!questionResult.resumePrompt) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: 'Question answers recorded.',
+          parseMode: 'plain',
+        });
+        ack();
+        return;
+      }
+      // A post-restart answer has no live SDK request to resolve. Resume the
+      // original task through the same fire-and-forget session-locked path as
+      // an ordinary message so the adapter loop remains available for further
+      // callbacks and same-session turns stay serialized.
+      dispatchSessionMessage(adapter, {
+        ...msg,
+        callbackData: undefined,
+        text: questionResult.resumePrompt,
+      });
+      return;
+    } else {
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
       // Send confirmation
@@ -475,9 +525,10 @@ async function handleMessage(
     }
     ack();
     return;
+    }
   }
 
-  const rawText = msg.text.trim();
+  let rawText = msg.text.trim();
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
 
   // Handle attachment-only download failures — surface error to user instead of silently dropping
@@ -507,6 +558,23 @@ async function handleMessage(
     }
     ack();
     return;
+  }
+
+  if (!msg.callbackData && !rawText.startsWith('/')) {
+    const fallbackResult = questionBroker.handleFallbackAnswer(msg.address.chatId, rawText);
+    if (fallbackResult.handled) {
+      if (!fallbackResult.accepted || !fallbackResult.resumePrompt) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: fallbackResult.error || 'Question response rejected.',
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        });
+        ack();
+        return;
+      }
+      rawText = fallbackResult.resumePrompt;
+    }
   }
 
   // ── Numeric shortcut for permission replies (feishu/qq/weixin only) ──
@@ -732,16 +800,27 @@ async function handleMessage(
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
-      await broker.forwardPermissionRequest(
-        adapter,
-        msg.address,
-        perm.permissionRequestId,
-        perm.toolName,
-        perm.toolInput,
-        binding.codepilotSessionId,
-        perm.suggestions,
-        msg.messageId,
-      );
+      if (perm.toolName === 'AskUserQuestion') {
+        await questionBroker.forwardQuestionRequest(
+          adapter,
+          msg.address,
+          perm.permissionRequestId,
+          perm.toolInput.questions,
+          binding.codepilotSessionId,
+          msg.messageId,
+        );
+      } else {
+        await broker.forwardPermissionRequest(
+          adapter,
+          msg.address,
+          perm.permissionRequestId,
+          perm.toolName,
+          perm.toolInput,
+          binding.codepilotSessionId,
+          perm.suggestions,
+          msg.messageId,
+        );
+      }
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, recoveryAttempt);
 
     // Persist recovery/session state before acknowledging the result externally.
@@ -967,6 +1046,13 @@ async function handleCommand(
         break;
       }
       const binding = router.resolve(msg.address);
+      const fixedMode = store.getSetting('bridge_fixed_mode');
+      if (fixedMode) {
+        response = args === fixedMode
+          ? `Mode is fixed to <b>${fixedMode}</b>.`
+          : `Command rejected: mode is fixed to <b>${fixedMode}</b>.`;
+        break;
+      }
       router.updateBinding(binding.id, { mode: args });
       response = `Mode set to <b>${args}</b>`;
       break;

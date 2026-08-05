@@ -117,6 +117,41 @@ export interface PermissionLinkRecord {
   suggestions: string;
 }
 
+export interface AskQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AskQuestion {
+  question: string;
+  header: string;
+  options: AskQuestionOption[];
+  multiSelect: boolean;
+}
+
+/** Durable lifecycle for one SDK AskUserQuestion request. */
+export type PendingQuestionState =
+  | 'pending-send'
+  | 'sent'
+  | 'fallback-pending'
+  | 'answered'
+  | 'expired';
+
+export interface PendingQuestionRecord {
+  questionRequestId: string;
+  channelType: string;
+  chatId: string;
+  sessionId: string;
+  questions: AskQuestion[];
+  answers: Record<string, string>;
+  state: PendingQuestionState;
+  generation: string;
+  messageId?: string;
+  replyToMessageId?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
 /** Input for inserting an outbound reference. */
 export interface OutboundRefInput {
   channelType: string;
@@ -195,6 +230,17 @@ export interface BridgeStore {
   /** List unresolved permission links for a given chat. */
   listPendingPermissionLinksByChat(chatId: string): PermissionLinkRecord[];
 
+  // ── Interactive questions (optional for legacy hosts; required to bridge AskUserQuestion) ──
+  /** Persist the full request before attempting card delivery. */
+  savePendingQuestion?(record: PendingQuestionRecord): void;
+  getPendingQuestion?(questionRequestId: string): PendingQuestionRecord | null;
+  listPendingQuestions?(): PendingQuestionRecord[];
+  transitionPendingQuestion?(
+    questionRequestId: string,
+    expectedStates: PendingQuestionState[],
+    update: Partial<PendingQuestionRecord>,
+  ): boolean;
+
   // ── Channel offsets (adapter watermarks) ──
   getChannelOffset(key: string): string;
   setChannelOffset(key: string, offset: string): void;
@@ -245,6 +291,13 @@ export interface PermissionGateway {
    * Returns true if the permission was found and resolved.
    */
   resolvePendingPermission(permissionRequestId: string, resolution: PermissionResolution): boolean;
+  /** Resolve a live AskUserQuestion callback. Optional for non-Claude hosts. */
+  resolvePendingQuestion?(
+    questionRequestId: string,
+    resolution: PermissionResolution & {
+      updatedInput?: { questions: AskQuestion[]; answers: Record<string, string> };
+    },
+  ): boolean;
 }
 
 // ── Host Interface: Lifecycle Hooks ──────────────────────────

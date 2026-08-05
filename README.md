@@ -16,7 +16,7 @@ Claude-to-IM was extracted from CodePilot as a standalone library for developers
 
 - **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient)
 - **Streaming previews**: Real-time response drafts via message editing, with per-platform throttling
-- **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session)
+- **Interactive prompts**: Inline tool approvals plus durable Feishu cards for Claude Code `AskUserQuestion` (single-select, multi-select, and Other input)
 - **Session binding**: Each IM chat maps to a persistent conversation session with working directory and model settings
 - **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards
 - **Reliable delivery**: Auto-chunking at platform limits, retry with exponential backoff, HTML fallback on parse errors, message deduplication
@@ -120,6 +120,7 @@ All settings are read through `BridgeStore.getSetting(key)`. Your host applicati
 | `bridge_{adapter}_stream_enabled` | Enable streaming previews | `"true"` |
 | `bridge_default_cwd` | Default working directory for new sessions | `$HOME` |
 | `bridge_model` | Default Claude model | Host decides |
+| `bridge_fixed_mode` | Optional instance-wide mode lock (`code`, `plan`, or `ask`) | Unset |
 
 Replace `{adapter}` with `telegram`, `discord`, or `feishu`.
 
@@ -131,9 +132,9 @@ Before adopting this library, be aware of the following constraints:
 
 This is a library, not a standalone application. You need to provide:
 
-- **`BridgeStore`** — A persistence layer with ~30 methods covering settings, sessions, messages, channel bindings, audit logs, dedup tracking, permission links, and channel offsets. This is the largest integration surface. See the full interface definition in [`src/lib/bridge/host.ts`](src/lib/bridge/host.ts).
+- **`BridgeStore`** — A persistence layer covering settings, sessions, messages, channel bindings, audit logs, dedup tracking, permission links, interactive questions, and channel offsets. Question persistence is optional for legacy hosts but required to bridge `AskUserQuestion`. See the full interface definition in [`src/lib/bridge/host.ts`](src/lib/bridge/host.ts).
 - **`LLMProvider`** — A wrapper around your LLM client that returns a `ReadableStream<string>` of SSE-formatted events. The stream format must match the Claude Code SDK's event protocol (text, tool_use, tool_result, permission_request, status, result events). See [`docs/development.md`](docs/development.md) for the full event format spec.
-- **`PermissionGateway`** — A way to resolve pending tool permissions from the Claude Code SDK.
+- **`PermissionGateway`** — A way to resolve pending tool permissions and, when supported by the host, return complete `AskUserQuestion` answer maps to the Claude Code SDK.
 - **`LifecycleHooks`** — Optional callbacks for bridge start/stop events.
 
 ### LLM Stream Format

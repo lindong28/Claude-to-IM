@@ -78,9 +78,9 @@ The bridge requires four host interfaces (defined in `host.ts`):
 
 | Interface | Purpose | Key Methods |
 |-----------|---------|-------------|
-| `BridgeStore` | Persistence (sessions, bindings, messages, settings) | `getSetting`, `getSession`, `addMessage`, `acquireSessionLock`, ... |
+| `BridgeStore` | Persistence (sessions, bindings, messages, settings, pending questions) | `getSetting`, `getSession`, `addMessage`, `savePendingQuestion`, `transitionPendingQuestion`, ... |
 | `LLMProvider` | AI model streaming | `streamChat(params) → ReadableStream<string>` |
-| `PermissionGateway` | Tool permission resolution | `resolvePendingPermission(id, resolution) → boolean` |
+| `PermissionGateway` | Tool permission and interactive-question resolution | `resolvePendingPermission(id, resolution)`, `resolvePendingQuestion(id, answers)` |
 | `LifecycleHooks` | Bridge lifecycle notifications | `onBridgeStart?()`, `onBridgeStop?()` |
 
 See `host.ts` for full interface definitions and `hosts/codepilot.ts` for a reference implementation.
@@ -108,12 +108,15 @@ All settings are read via `BridgeStore.getSetting(key)`. Key settings:
 - `bridge_feishu_group_policy=allowlist` + `bridge_feishu_group_allow_from` — fail-closed Feishu group access
 - `bridge_feishu_require_mention=true` — require the bot mention in an allowed group
 - `bridge_session_policy=fixed-confirm-recovery` — keep one thread per chat and require explicit same-chat recovery confirmation
+- `bridge_fixed_mode=code|plan|ask` — optional instance-wide mode lock; omitted preserves mutable `/mode`
 
 ### Fixed session recovery
 
 Under `fixed-confirm-recovery`, `/cwd`, `/new`, and `/bind` are disabled. An explicit provider resume failure marks only that binding as recovery-pending; ordinary messages make no provider call. An authorized user in the same chat sends `@bot /recover confirm` to arm recovery. The next ordinary message atomically consumes the authorization, starts one fresh thread, and persists the replacement binding. The confirm command itself never calls the provider.
 
 Hosts that set Codex approval policy to `never` must not imply an interactive permission flow: Codex produces no permission request, Feishu sends no permission card, and `card.action.trigger` is not required for that deployment. The sandbox remains the enforcement boundary.
+
+Claude Code `AskUserQuestion` is distinct from tool approval. A supporting host persists every request before card delivery, exposes compare-and-set pending-question transitions, and resolves the SDK request with a complete question-to-answer map. Feishu cards cover one to four questions, single-select, multi-select, and free-form Other input. Restart re-issues unresolved cards with a new generation; stale, unauthorized, incomplete, or repeated callbacks do not resume the task. Adapters without question-card capability, send failure, and card timeout enter expiring text fallback instead of silently dropping the question.
 
 ## Security
 
@@ -122,6 +125,7 @@ Hosts that set Codex approval policy to `never` must not imply an interactive pe
 - Authorization: per-adapter allowed users/channels/guilds
 - Audit logging: all inbound/outbound messages logged
 - Permission dedup: atomic claim-and-resolve prevents double-clicks
+- Outbound secret containment: exact known secret literals are redacted at the unified delivery exit, including literals split across streaming chunks
 
 See `security/validators.ts` and `security/rate-limiter.ts`.
 

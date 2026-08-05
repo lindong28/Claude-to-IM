@@ -9,6 +9,7 @@ The bridge exposes an LLM to messages from IM platforms. Key threats:
 3. **Command injection**: Path traversal or shell metacharacters in /cwd commands
 4. **Denial of service**: Message flooding
 5. **Permission bypass**: Forged callback queries or double-click race conditions
+6. **Secret exfiltration**: A configured credential appears in model text, errors, streaming chunks, or card content
 
 ## Mitigations
 
@@ -22,6 +23,8 @@ Each adapter implements `isAuthorized(userId, chatId)`:
 Unauthorized messages are silently dropped (no response leak).
 
 For a fixed Feishu group deployment, require all three controls together: non-empty allowed users, group policy `allowlist` with non-empty allowed groups, and mention-required. Apply the same user/group authorization to message events and card callbacks.
+
+Interactive-question callbacks are generation-scoped and use compare-and-set lifecycle transitions. After a restart, re-issued cards invalidate prior generations; a first valid complete answer is terminal, and later clicks cannot resume the provider again.
 
 ### Input Validation (`security/validators.ts`)
 
@@ -61,6 +64,10 @@ Host-side Codex call-envelope/rollout evidence is private operational data and n
 - All platform APIs use HTTPS
 - Bot tokens are stored in the host's settings store (not in bridge code)
 - Token masking in UI prevents accidental exposure
+
+### Outbound Secret Redaction
+
+The delivery boundary replaces exact secret literals supplied by the host before sending final replies, streaming previews, error messages, or interactive-card text. Streaming output retains boundary state so a literal split across consecutive chunks is still matched. This protects only registered literal values; it is not general DLP and does not detect encoded, transformed, or otherwise unknown secrets.
 
 ## Recommendations for Deployments
 

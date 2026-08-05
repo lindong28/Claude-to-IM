@@ -17,6 +17,9 @@ export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
 
+  /** Whether this adapter can render and receive structured question cards. */
+  readonly supportsQuestionCards: boolean = false;
+
   /**
    * Start the adapter (connect, begin polling/websocket, etc.).
    * Must be idempotent — calling start() on an already-running adapter is a no-op.

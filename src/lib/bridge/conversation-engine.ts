@@ -17,6 +17,11 @@ import type {
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
+import {
+  knownOutboundSecrets,
+  LiteralStreamRedactor,
+  redactLiterals,
+} from './security/outbound-redaction.js';
 
 export interface PermissionRequestInfo {
   permissionRequestId: string;
@@ -220,7 +225,7 @@ export async function processMessage(
  * Consume an SSE stream and extract response data.
  * Mirrors the collectStreamResponse() logic from chat/route.ts.
  */
-async function consumeStream(
+export async function consumeStream(
   stream: ReadableStream<string>,
   sessionId: string,
   onPermissionRequest?: OnPermissionRequest,
@@ -234,6 +239,9 @@ async function consumeStream(
   let currentText = '';
   /** Monotonically accumulated text for streaming preview — never resets on tool_use. */
   let previewText = '';
+  const outboundSecrets = knownOutboundSecrets(store);
+  const textRedactor = new LiteralStreamRedactor(outboundSecrets);
+  let emittedTextLength = 0;
   let tokenUsage: TokenUsage | null = null;
   let hasError = false;
   let errorMessage = '';
@@ -260,9 +268,10 @@ async function consumeStream(
 
         switch (event.type) {
           case 'text':
-            currentText += event.data;
+            previewText = textRedactor.push(event.data);
+            currentText += previewText.slice(emittedTextLength);
+            emittedTextLength = previewText.length;
             if (onPartialText) {
-              previewText += event.data;
               try { onPartialText(previewText); } catch { /* non-critical */ }
             }
             break;
@@ -365,7 +374,7 @@ async function consumeStream(
 
           case 'error':
             hasError = true;
-            errorMessage = event.data || 'Unknown error';
+            errorMessage = redactLiterals(event.data || 'Unknown error', outboundSecrets);
             break;
 
           case 'recovery_required':
@@ -389,6 +398,16 @@ async function consumeStream(
 
           // tool_output, tool_timeout, mode_changed, done — ignored for bridge
         }
+      }
+    }
+
+    const finalPreviewText = textRedactor.finish();
+    if (finalPreviewText.length > emittedTextLength) {
+      currentText += finalPreviewText.slice(emittedTextLength);
+      previewText = finalPreviewText;
+      emittedTextLength = finalPreviewText.length;
+      if (onPartialText) {
+        try { onPartialText(previewText); } catch { /* non-critical */ }
       }
     }
 
@@ -459,7 +478,10 @@ async function consumeStream(
       responseText: '',
       tokenUsage,
       hasError: true,
-      errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
+      errorMessage: redactLiterals(
+        isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
+        outboundSecrets,
+      ),
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
       recoveryRequired,

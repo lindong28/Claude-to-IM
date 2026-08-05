@@ -48,6 +48,8 @@ export interface InboundMessage {
   callbackData?: string;
   /** For callback queries: the message ID of the original message that triggered the callback */
   callbackMessageId?: string;
+  /** Form values submitted by an interactive card action. */
+  callbackFormValue?: Record<string, unknown>;
   /** Platform-specific raw update object (for adapter-specific handling) */
   raw?: unknown;
   /** Adapter-specific update ID for deferred offset acknowledgement */
@@ -66,6 +68,12 @@ export interface OutboundMessage {
   parseMode?: 'HTML' | 'Markdown' | 'plain';
   /** Inline keyboard buttons */
   inlineButtons?: InlineButton[][];
+  /** Structured AskUserQuestion card. Only adapters with form cards consume this. */
+  questionCard?: {
+    questionRequestId: string;
+    generation: string;
+    questions: import('./host.js').AskQuestion[];
+  };
   /** If replying to a specific message */
   replyToMessageId?: string;
 }

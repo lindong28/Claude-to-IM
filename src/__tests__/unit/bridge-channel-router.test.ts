@@ -19,7 +19,7 @@ import type { ChannelBinding } from '../../lib/bridge/types';
 
 // ── Mock Store ──────────────────────────────────────────────
 
-function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, { id: string; working_directory: string; model: string }> } {
+function createMockStore(settings: Record<string, string> = {}): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, { id: string; working_directory: string; model: string }> } {
   const bindings = new Map<string, ChannelBinding>();
   const sessions = new Map<string, { id: string; working_directory: string; model: string }>();
   let nextId = 1;
@@ -28,6 +28,7 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
     bindings,
     sessions,
     getSetting(key: string) {
+      if (key in settings) return settings[key];
       if (key === 'bridge_default_work_dir') return '/tmp/test';
       if (key === 'bridge_default_model') return 'claude-3';
       if (key === 'bridge_default_provider_id') return '';
@@ -45,7 +46,7 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
         sdkSessionId: '',
         workingDirectory: data.workingDirectory,
         model: data.model,
-        mode: 'code',
+        mode: (data.mode as ChannelBinding['mode']) || 'code',
         active: true,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -164,6 +165,14 @@ describe('channel-router', () => {
       '/custom/path',
     );
     assert.equal(binding.workingDirectory, '/custom/path');
+  });
+
+  it('keeps the historical code default when fixed mode is not opted in', () => {
+    store = createMockStore({ bridge_default_mode: 'plan' });
+    setupContext(store);
+
+    const binding = router.createBinding({ channelType: 'telegram', chatId: 'default-mode' });
+    assert.equal(binding.mode, 'code');
   });
 
   it('bindToSession() returns null for non-existent session', () => {

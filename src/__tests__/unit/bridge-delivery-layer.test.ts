@@ -37,7 +37,7 @@ function createMockAdapter(opts?: {
 
 // ── Mock Store ──────────────────────────────────────────────
 
-function createMockStore() {
+function createMockStore(settings: Record<string, string> = {}) {
   const auditLogs: Array<{ chatId: string; direction: string; summary: string }> = [];
   const outboundRefs: Array<{ platformMessageId: string; purpose: string }> = [];
   const dedupKeys = new Set<string>();
@@ -46,7 +46,7 @@ function createMockStore() {
     auditLogs,
     outboundRefs,
     dedupKeys,
-    getSetting: () => null,
+    getSetting: (key: string) => settings[key] ?? null,
     getChannelBinding: () => null,
     upsertChannelBinding: () => ({} as any),
     updateChannelBinding: () => {},
@@ -119,6 +119,49 @@ describe('delivery-layer', () => {
     assert.ok(result.ok);
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0], 'Hello!');
+  });
+
+  it('redacts known secrets at the unified exit for replies, errors, and question cards', async () => {
+    store = createMockStore({ bridge_feishu_app_secret: 'unified-secret-canary' });
+    setupContext(store);
+    const sent: OutboundMessage[] = [];
+    const adapter = createMockAdapter({
+      sendFn: async (message) => {
+        sent.push(message);
+        return { ok: true, messageId: `msg-${sent.length}` };
+      },
+    });
+
+    await deliver(adapter, {
+      address: { channelType: 'telegram', chatId: 'reply' },
+      text: 'final unified-secret-canary',
+    });
+    await deliver(adapter, {
+      address: { channelType: 'telegram', chatId: 'error' },
+      text: 'error unified-secret-canary',
+    });
+    await deliver(adapter, {
+      address: { channelType: 'feishu', chatId: 'card' },
+      text: 'fallback unified-secret-canary',
+      questionCard: {
+        questionRequestId: 'ask-redaction',
+        generation: 'generation',
+        questions: [{
+          question: 'Reveal unified-secret-canary?',
+          header: 'unified-secret-canary',
+          options: [
+            { label: 'unified-secret-canary', description: 'secret option' },
+            { label: 'Safe', description: 'safe option' },
+          ],
+          multiSelect: false,
+        }],
+      },
+    });
+
+    assert.equal(sent.length, 3);
+    assert.doesNotMatch(JSON.stringify(sent), /unified-secret-canary/);
+    assert.match(JSON.stringify(sent), /\[REDACTED\]/);
+    assert.doesNotMatch(JSON.stringify(store.auditLogs), /unified-secret-canary/);
   });
 
   it('chunks long messages at platform limit', async () => {

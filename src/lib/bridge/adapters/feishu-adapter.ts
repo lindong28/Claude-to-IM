@@ -36,6 +36,7 @@ import {
   buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
+  buildQuestionCard,
   formatElapsed,
 } from '../markdown/feishu.js';
 
@@ -146,6 +147,7 @@ const MIME_BY_TYPE: Record<string, string> = {
 
 export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
+  override readonly supportsQuestionCards: boolean = true;
 
   private running = false;
   private queue: InboundMessage[] = [];
@@ -391,6 +393,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         timestamp: Date.now(),
         callbackData,
         callbackMessageId: messageId,
+        callbackFormValue: event?.action?.form_value ?? {},
       };
       reportFeishuHealth('accepted-inbound');
       this.enqueue(callbackMsg);
@@ -683,6 +686,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     let text = message.text;
 
+    if (message.questionCard) {
+      return this.sendQuestionCard(message.address.chatId, message.questionCard);
+    }
+
     // Convert HTML to markdown for Feishu rendering (e.g. command responses)
     if (message.parseMode === 'HTML') {
       text = htmlToFeishuMarkdown(text);
@@ -705,6 +712,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendAsCard(message.address.chatId, text);
     }
     return this.sendAsPost(message.address.chatId, text);
+  }
+
+  private async sendQuestionCard(
+    chatId: string,
+    questionCard: NonNullable<OutboundMessage['questionCard']>,
+  ): Promise<SendResult> {
+    try {
+      const content = buildQuestionCard(
+        questionCard.questions,
+        questionCard.questionRequestId,
+        questionCard.generation,
+        chatId,
+      );
+      const res = await this.restClient!.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content,
+        },
+      });
+      if (res?.data?.message_id) return { ok: true, messageId: res.data.message_id };
+      return { ok: false, error: res?.msg || 'Question card send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Question card send failed' };
+    }
   }
 
   /**

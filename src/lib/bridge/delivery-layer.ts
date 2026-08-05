@@ -15,6 +15,7 @@ import { PLATFORM_LIMITS as limits } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 import { getBridgeContext } from './context.js';
 import { ChatRateLimiter } from './security/rate-limiter.js';
+import { knownOutboundSecrets, redactLiterals } from './security/outbound-redaction.js';
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
@@ -143,6 +144,25 @@ export async function deliver(
   },
 ): Promise<SendResult> {
   const { store } = getBridgeContext();
+  const secrets = knownOutboundSecrets(store);
+  message = {
+    ...message,
+    text: redactLiterals(message.text, secrets),
+    ...(message.questionCard ? {
+      questionCard: {
+        ...message.questionCard,
+        questions: message.questionCard.questions.map((question) => ({
+          ...question,
+          question: redactLiterals(question.question, secrets),
+          header: redactLiterals(question.header, secrets),
+          options: question.options.map((option) => ({
+            label: redactLiterals(option.label, secrets),
+            description: redactLiterals(option.description, secrets),
+          })),
+        })),
+      },
+    } : {}),
+  };
 
   // Dedup check
   if (opts?.dedupKey) {
