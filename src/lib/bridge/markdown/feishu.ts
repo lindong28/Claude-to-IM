@@ -187,6 +187,7 @@ export function buildPermissionButtonCard(
   text: string,
   permissionRequestId: string,
   chatId?: string,
+  requireMention = false,
 ): string {
   const buttons = [
     { label: 'Allow', type: 'primary', action: 'allow' },
@@ -229,7 +230,9 @@ export function buildPermissionButtonCard(
         { tag: 'hr' },
         {
           tag: 'markdown',
-          content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
+          content: requireMention
+            ? 'Or mention the bot and reply: `1` Allow · `2` Allow Session · `3` Deny'
+            : 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
           text_size: 'notation',
         },
       ],
@@ -274,6 +277,7 @@ export function buildQuestionCard(
 
   elements.push({
     tag: 'button',
+    name: 'submit_answers',
     text: { tag: 'plain_text', content: 'Submit answers' },
     type: 'primary',
     action_type: 'form_submit',

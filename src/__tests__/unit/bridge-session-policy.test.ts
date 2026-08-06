@@ -6,6 +6,7 @@ import { initBridgeContext } from '../../lib/bridge/context';
 import { _testOnly } from '../../lib/bridge/bridge-manager';
 import * as feishuModule from '../../lib/bridge/adapters/feishu-adapter';
 import * as router from '../../lib/bridge/channel-router';
+import { questionBroker } from '../../lib/bridge/question-broker';
 import type {
   BridgeStore,
   ExternalHealthEvent,
@@ -465,6 +466,26 @@ await describe('fixed-confirm-recovery session policy', { concurrency: 1 }, () =
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
+    pending.set('ask-leftover-fallback', {
+      questionRequestId: 'ask-leftover-fallback',
+      channelType: 'feishu',
+      chatId: restartGroup,
+      sessionId: binding.codepilotSessionId,
+      questions: [{
+        question: 'Continue?',
+        header: 'Continue',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'fallback-pending',
+      generation: 'leftover-generation',
+      createdAt: new Date(0).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
     restartStore.getPendingQuestion = (id) => pending.get(id) ?? null;
     restartStore.listPendingQuestions = () => [...pending.values()];
     restartStore.transitionPendingQuestion = (id, expected, update) => {
@@ -478,11 +499,13 @@ await describe('fixed-confirm-recovery session policy', { concurrency: 1 }, () =
     let markProviderStarted!: () => void;
     const providerStarted = new Promise<void>((resolve) => { markProviderStarted = resolve; });
     let providerCalls = 0;
+    let resumedProviderPrompt = '';
     initBridgeContext({
       store: restartStore,
       llm: {
-        streamChat() {
+        streamChat(params) {
           providerCalls += 1;
+          resumedProviderPrompt = params.prompt;
           markProviderStarted();
           return new ReadableStream({
             start(controller) {
@@ -521,6 +544,15 @@ await describe('fixed-confirm-recovery session policy', { concurrency: 1 }, () =
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('provider dispatch timed out')), 100)),
     ]);
     assert.equal(providerCalls, 1);
+    assert.match(resumedProviderPrompt, /Database\?: PostgreSQL/);
+    assert.doesNotMatch(resumedProviderPrompt, /Continue\?: Answers to the pending/s);
+    assert.equal(pending.get('ask-leftover-fallback')!.state, 'fallback-pending');
+    const resumedStart = adapter.sent.find((message) => message.text === 'Task started.');
+    assert.equal(
+      resumedStart?.address.isGroup,
+      true,
+      'the durable question record must restore mention-safe group state before resume dispatch',
+    );
     const managerState = (globalThis as unknown as {
       __bridge_manager__: { sessionLocks: Map<string, Promise<void>> };
     }).__bridge_manager__;
@@ -530,6 +562,373 @@ await describe('fixed-confirm-recovery session policy', { concurrency: 1 }, () =
     await managerState.sessionLocks.get(binding.codepilotSessionId);
     assert.equal(managerState.sessionLocks.has(binding.codepilotSessionId), false);
     assert.equal(pending.get('ask-restart-manager')!.state, 'answered');
+  });
+
+  it('reports a question-forwarding persistence failure and releases the live provider wait', async () => {
+    const failureGroup = 'group_question_forward_failure_canary';
+    const adapter = new TestAdapter([failureGroup]);
+    const store = createStore({ bridge_default_work_dir: '/fixed' });
+    seedBinding(store, failureGroup, '');
+    store.savePendingQuestion = () => {
+      throw new Error('injected pending-question store failure');
+    };
+    store.transitionPendingQuestion = () => false;
+
+    let controller!: ReadableStreamDefaultController<string>;
+    const providerStream = new ReadableStream<string>({
+      start(nextController) {
+        controller = nextController;
+        nextController.enqueue(sse('permission_request', {
+          permissionRequestId: 'ask-forward-failure',
+          toolName: 'AskUserQuestion',
+          toolInput: {
+            questions: [{
+              question: 'Continue?',
+              header: 'Continue',
+              options: [
+                { label: 'Yes', description: 'Continue' },
+                { label: 'No', description: 'Stop' },
+              ],
+              multiSelect: false,
+            }],
+          },
+        }));
+      },
+    });
+    const resolutions: Array<{ id: string; behavior: string; message?: string }> = [];
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => providerStream },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion(id, resolution) {
+          resolutions.push({ id, behavior: resolution.behavior, message: resolution.message });
+          controller.close();
+          return true;
+        },
+      },
+      lifecycle: {},
+    });
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        _testOnly.handleMessage(adapter, inbound(failureGroup, USER_OK, 'question forwarding failure')),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            controller.close();
+            reject(new Error('question wait was not released'));
+          }, 250);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+
+    assert.deepEqual(resolutions, [{
+      id: 'ask-forward-failure',
+      behavior: 'deny',
+      message: 'Interactive question could not be delivered',
+    }]);
+    assert.match(adapter.sent.map((message) => message.text).join('\n'), /could not deliver the question.*send the request again/i);
+  });
+
+  it('expires a persisted pending-send record when question delivery throws', async () => {
+    const failureGroup = 'group_question_delivery_throw_canary';
+    class ThrowingQuestionAdapter extends TestAdapter {
+      override readonly supportsQuestionCards = true;
+      override async send(message: OutboundMessage): Promise<SendResult> {
+        if (message.questionCard) throw new Error('injected Feishu SDK send throw');
+        return super.send(message);
+      }
+    }
+    const adapter = new ThrowingQuestionAdapter([failureGroup]);
+    const store = createStore({ bridge_default_work_dir: '/fixed' });
+    seedBinding(store, failureGroup, '');
+    const pending = new Map<string, PendingQuestionRecord>();
+    store.savePendingQuestion = (record) => pending.set(record.questionRequestId, structuredClone(record));
+    store.getPendingQuestion = (id) => pending.get(id) ?? null;
+    store.listPendingQuestions = () => [...pending.values()];
+    store.transitionPendingQuestion = (id, expected, update) => {
+      const current = pending.get(id);
+      if (!current || !expected.includes(current.state)) return false;
+      pending.set(id, { ...current, ...update });
+      return true;
+    };
+    let controller!: ReadableStreamDefaultController<string>;
+    const providerStream = new ReadableStream<string>({
+      start(nextController) {
+        controller = nextController;
+        nextController.enqueue(sse('permission_request', {
+          permissionRequestId: 'ask-delivery-throw',
+          toolName: 'AskUserQuestion',
+          toolInput: { questions: [{
+            question: 'Continue?',
+            header: 'Continue',
+            options: [
+              { label: 'Yes', description: 'Continue' },
+              { label: 'No', description: 'Stop' },
+            ],
+            multiSelect: false,
+          }] },
+        }));
+      },
+    });
+    const resolutions: Array<{ id: string; behavior: string; message?: string }> = [];
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => providerStream },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion(id, resolution) {
+          resolutions.push({ id, behavior: resolution.behavior, message: resolution.message });
+          controller.close();
+          return true;
+        },
+      },
+      lifecycle: {},
+    });
+
+    await _testOnly.handleMessage(adapter, inbound(failureGroup, USER_OK, 'question delivery throw'));
+
+    assert.equal(pending.get('ask-delivery-throw')!.state, 'expired');
+    assert.deepEqual(resolutions, [{
+      id: 'ask-delivery-throw',
+      behavior: 'deny',
+      message: 'Interactive question could not be delivered',
+    }]);
+    const restoreAdapter = new TestAdapter([failureGroup]);
+    await questionBroker.restorePendingQuestions(restoreAdapter);
+    assert.equal(restoreAdapter.sent.length, 0);
+  });
+
+  it('/stop reports released waits even when no durable transition wins', async () => {
+    const stopGroup = 'group_stop_lost_cas_message_canary';
+    const stopAdapter = new TestAdapter([stopGroup]);
+    const stopStore = createStore({ bridge_default_work_dir: '/fixed' });
+    seedBinding(stopStore, stopGroup, '');
+    const record: PendingQuestionRecord = {
+      questionRequestId: 'ask-stop-lost-cas-message',
+      channelType: 'feishu',
+      chatId: stopGroup,
+      sessionId: 'session',
+      questions: [{
+        question: 'Continue?',
+        header: 'Continue',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'sent',
+      generation: 'lost-cas-generation',
+      messageId: 'lost-cas-card',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    stopStore.getPendingQuestion = () => record;
+    stopStore.listPendingQuestions = () => [record];
+    stopStore.transitionPendingQuestion = () => false;
+    initBridgeContext({
+      store: stopStore,
+      llm: { streamChat: () => stream() },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion: () => true,
+      },
+      lifecycle: {},
+    });
+
+    await _testOnly.handleMessage(stopAdapter, inbound(stopGroup, USER_OK, '/stop'));
+
+    const response = stopAdapter.sent.at(-1)!.text;
+    assert.match(response, /released 1 live question wait/i);
+    assert.match(response, /could not close 1 pending question/i);
+    assert.doesNotMatch(response, /all pending questions are closed|no pending question wait was released/i);
+  });
+
+  it('/stop closes every pending question and releases every live provider wait', async () => {
+    const stopGroup = 'group_stop_question_canary';
+    class QuestionCardAdapter extends TestAdapter {
+      override readonly supportsQuestionCards = true;
+    }
+    const questionAdapter = new QuestionCardAdapter([stopGroup]);
+    const stopStore = createStore({ bridge_default_work_dir: '/fixed' });
+    const binding = seedBinding(stopStore, stopGroup, '');
+    const pending = new Map<string, PendingQuestionRecord>();
+    stopStore.savePendingQuestion = (record) => pending.set(record.questionRequestId, structuredClone(record));
+    stopStore.getPendingQuestion = (id) => pending.get(id) ?? null;
+    stopStore.listPendingQuestions = () => [...pending.values()];
+    stopStore.transitionPendingQuestion = (id, expected, update) => {
+      const current = pending.get(id);
+      if (!current || !expected.includes(current.state)) return false;
+      pending.set(id, { ...current, ...update });
+      return true;
+    };
+    const questionResolutions: Array<{ id: string; behavior: string; message?: string }> = [];
+    initBridgeContext({
+      store: stopStore,
+      llm: { streamChat: () => stream() },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion(id, resolution) {
+          questionResolutions.push({ id, behavior: resolution.behavior, message: resolution.message });
+          return id !== 'ask-stop-existing-fallback';
+        },
+      },
+      lifecycle: {},
+    });
+    await questionBroker.forwardQuestionRequest(
+      questionAdapter,
+      { channelType: 'feishu', chatId: stopGroup },
+      'ask-stop-release',
+      [{
+        question: 'Continue?',
+        header: 'Continue',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      binding.codepilotSessionId,
+    );
+    stopStore.savePendingQuestion({
+      questionRequestId: 'ask-stop-old-stale',
+      channelType: 'feishu',
+      chatId: stopGroup,
+      sessionId: binding.codepilotSessionId,
+      questions: [{
+        question: 'Old question?',
+        header: 'Old',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'sent',
+      generation: 'old-generation',
+      messageId: 'old-card',
+      createdAt: new Date(0).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    stopStore.savePendingQuestion({
+      questionRequestId: 'ask-stop-existing-fallback',
+      channelType: 'feishu',
+      chatId: stopGroup,
+      sessionId: binding.codepilotSessionId,
+      questions: [{
+        question: 'Already waiting?',
+        header: 'Waiting',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'fallback-pending',
+      generation: 'existing-fallback-generation',
+      createdAt: new Date(-1).toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.equal(pending.get('ask-stop-release')!.state, 'sent');
+    await _testOnly.handleMessage(questionAdapter, inbound(stopGroup, USER_OK, '/stop'));
+
+    assert.equal(pending.get('ask-stop-release')!.state, 'expired');
+    assert.equal(pending.get('ask-stop-old-stale')!.state, 'expired');
+    assert.equal(pending.get('ask-stop-existing-fallback')!.state, 'expired');
+    assert.deepEqual(questionResolutions, [
+      {
+        id: 'ask-stop-existing-fallback',
+        behavior: 'deny',
+        message: 'Interactive question expired',
+      },
+      {
+        id: 'ask-stop-old-stale',
+        behavior: 'deny',
+        message: 'Interactive question expired',
+      },
+      {
+        id: 'ask-stop-release',
+        behavior: 'deny',
+        message: 'Interactive question expired',
+      },
+    ]);
+    const stopResponse = questionAdapter.sent.at(-1)!.text;
+    assert.match(stopResponse, /released 2 live question waits/i);
+    assert.match(stopResponse, /closed 3 pending questions/i);
+    assert.match(stopResponse, /next message starts new work/i);
+    assert.doesNotMatch(stopResponse, /reply to the single text fallback/i);
+    assert.equal(
+      questionBroker.handleFallbackAnswer(
+        { channelType: 'feishu', chatId: stopGroup },
+        'forget it, run the tests instead',
+      ).handled,
+      false,
+    );
+
+    await _testOnly.handleMessage(questionAdapter, inbound(stopGroup, USER_OK, '/stop'));
+    assert.match(questionAdapter.sent.at(-1)!.text, /no task is currently running.*no pending question wait/i);
+    questionBroker.dispose();
+  });
+
+  it('/stop distinguishes durable transitions from live provider waits released', async () => {
+    const stopGroup = 'group_stop_truthful_release_canary';
+    const stopAdapter = new TestAdapter([stopGroup]);
+    const stopStore = createStore({ bridge_default_work_dir: '/fixed' });
+    seedBinding(stopStore, stopGroup, '');
+    const pending = new Map<string, PendingQuestionRecord>();
+    pending.set('ask-stale-no-live-wait', {
+      questionRequestId: 'ask-stale-no-live-wait',
+      channelType: 'feishu',
+      chatId: stopGroup,
+      sessionId: 'session',
+      questions: [{
+        question: 'Continue?',
+        header: 'Continue',
+        options: [
+          { label: 'Yes', description: 'Continue' },
+          { label: 'No', description: 'Stop' },
+        ],
+        multiSelect: false,
+      }],
+      answers: {},
+      state: 'sent',
+      generation: 'stale-generation',
+      messageId: 'stale-card',
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    stopStore.getPendingQuestion = (id) => pending.get(id) ?? null;
+    stopStore.listPendingQuestions = () => [...pending.values()];
+    stopStore.transitionPendingQuestion = (id, expected, update) => {
+      const current = pending.get(id);
+      if (!current || !expected.includes(current.state)) return false;
+      pending.set(id, { ...current, ...update });
+      return true;
+    };
+    initBridgeContext({
+      store: stopStore,
+      llm: { streamChat: () => stream() },
+      permissions: {
+        resolvePendingPermission: () => false,
+        resolvePendingQuestion: () => false,
+      },
+      lifecycle: {},
+    });
+
+    await _testOnly.handleMessage(stopAdapter, inbound(stopGroup, USER_OK, '/stop'));
+
+    assert.equal(pending.get('ask-stale-no-live-wait')!.state, 'expired');
+    assert.match(stopAdapter.sent.at(-1)!.text, /no live provider wait was released/i);
+    assert.match(stopAdapter.sent.at(-1)!.text, /next message starts new work/i);
+    assert.doesNotMatch(stopAdapter.sent.at(-1)!.text, /released 1 pending question/i);
+    questionBroker.dispose();
   });
 
   it('acknowledges a second Feishu task while it is queued behind the session lock', async () => {
@@ -748,6 +1147,11 @@ await describe('Feishu policy normalization and identifier-safe filters', { conc
     const queued = await adapter.consumeOne();
     assert.equal(queued?.address.chatId, groups.a);
     assert.equal(queued?.address.userId, USER_OK);
+    assert.equal(
+      queued?.address.isGroup,
+      undefined,
+      'card.action.trigger has no chat_type; semantic consumers recover it from durable request state',
+    );
     assert.deepEqual(queued?.callbackFormValue, { q_0: 'Choice A', other_0: '' });
     assert.deepEqual(healthEvents, [{ component: 'feishu', state: 'accepted-inbound' }]);
   });

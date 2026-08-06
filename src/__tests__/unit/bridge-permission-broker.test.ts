@@ -367,4 +367,38 @@ describe('permission-broker', () => {
     assert.ok(adapter.sent[1].text.length <= PLATFORM_LIMITS.telegram);
     assert.equal(warnings.filter((line) => line.includes('formatted approval rejected')).length, 1);
   });
+
+  it('does not tell a Feishu 1:1 chat to mention the bot in the plain fallback', async () => {
+    class FallbackAdapter extends BaseChannelAdapter {
+      readonly channelType = 'feishu' as const;
+      sent: OutboundMessage[] = [];
+      async start() {}
+      async stop() {}
+      isRunning() { return true; }
+      async consumeOne() { return null; }
+      async send(message: OutboundMessage): Promise<SendResult> {
+        this.sent.push(message);
+        return this.sent.length === 1
+          ? { ok: false, error: 'formatted approval rejected', httpStatus: 400 } as SendResult
+          : { ok: true, messageId: 'plain-fallback-message' };
+      }
+      validateConfig() { return null; }
+      isAuthorized() { return true; }
+    }
+    const adapter = new FallbackAdapter();
+    store.getSetting = (key?: string) => key === 'bridge_feishu_require_mention' ? 'true' : null;
+    setupContext(store, gateway);
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'direct-permission-fallback', userId: 'user-1', isGroup: false },
+      'permission-direct-fallback',
+      'Bash',
+      { command: 'pwd' },
+    );
+
+    assert.equal(adapter.sent.length, 2);
+    assert.doesNotMatch(adapter.sent[1].text, /mention the bot/i);
+    assert.match(adapter.sent[1].text, /reply with one of these commands/i);
+  });
 });

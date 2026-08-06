@@ -185,4 +185,30 @@ describe('Feishu CardKit streaming cards', () => {
     );
   });
 
+  it('deletes a typing reaction from the message that owns the reaction', async () => {
+    let deletedPath: unknown;
+    const adapter = new FeishuAdapter() as any;
+    adapter.streamingCardUnavailable.add('chat-typing');
+    adapter.restClient = {
+      im: {
+        messageReaction: {
+          create: async () => ({ data: { reaction_id: 'typing-reaction-id' } }),
+          delete: async (payload: any) => { deletedPath = payload.path; },
+        },
+      },
+    };
+    adapter.lastIncomingMessageId.set('chat-typing', 'reaction-owner-message');
+    adapter.onMessageStart('chat-typing');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    adapter.lastIncomingMessageId.set('chat-typing', 'newer-incoming-message');
+    adapter.onMessageEnd('chat-typing');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(deletedPath, {
+      message_id: 'reaction-owner-message',
+      reaction_id: 'typing-reaction-id',
+    });
+  });
+
 });

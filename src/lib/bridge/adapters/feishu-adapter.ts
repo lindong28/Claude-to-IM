@@ -163,8 +163,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
   private lastIncomingMessageId = new Map<string, string>();
-  /** Track active typing reaction IDs per chat for cleanup. */
-  private typingReactions = new Map<string, string>();
+  /** Track each typing reaction together with the message that owns it. */
+  private typingReactions = new Map<string, { messageId: string; reactionId: string; generation: number }>();
+  private typingGenerations = new Map<string, number>();
   /** Active streaming card state per chatId. */
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
@@ -280,6 +281,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.seenMessageIds.clear();
     this.lastIncomingMessageId.clear();
     this.typingReactions.clear();
+    this.typingGenerations.clear();
 
     console.log('[feishu-adapter] Stopped');
   }
@@ -318,6 +320,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
    */
   onMessageStart(chatId: string): void {
     const messageId = this.lastIncomingMessageId.get(chatId);
+    const generation = (this.typingGenerations.get(chatId) ?? 0) + 1;
+    this.typingGenerations.set(chatId, generation);
 
     // Create streaming card (fire-and-forget — fallback to traditional if fails)
     if (messageId) {
@@ -332,7 +336,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }).then((res) => {
       const reactionId = (res as any)?.data?.reaction_id;
       if (reactionId) {
-        this.typingReactions.set(chatId, reactionId);
+        if (this.typingGenerations.get(chatId) === generation) {
+          this.typingReactions.set(chatId, { messageId, reactionId, generation });
+        } else {
+          this.restClient?.im.messageReaction.delete({
+            path: { message_id: messageId, reaction_id: reactionId },
+          }).catch(() => { /* ignore late cleanup */ });
+        }
       }
     }).catch((err) => {
       const code = (err as { code?: number })?.code;
@@ -351,12 +361,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.cleanupCard(chatId);
 
     // Remove typing reaction (same as before)
-    const reactionId = this.typingReactions.get(chatId);
-    const messageId = this.lastIncomingMessageId.get(chatId);
-    if (!reactionId || !messageId || !this.restClient) return;
+    this.typingGenerations.set(chatId, (this.typingGenerations.get(chatId) ?? 0) + 1);
+    const reaction = this.typingReactions.get(chatId);
+    if (!reaction || !this.restClient) return;
     this.typingReactions.delete(chatId);
     this.restClient.im.messageReaction.delete({
-      path: { message_id: messageId, reaction_id: reactionId },
+      path: { message_id: reaction.messageId, reaction_id: reaction.reactionId },
     }).catch(() => { /* ignore */ });
   }
 
@@ -754,7 +764,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Permission prompts have their own HTML-to-card conversion so code blocks
     // can be kept fence-safe before the schema 2.0 markdown element is built.
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      const requireMention = message.address.isGroup === true
+        && getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
+      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons, requireMention);
     }
 
     // Convert HTML to markdown for Feishu rendering (e.g. command responses)
@@ -886,6 +898,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     chatId: string,
     text: string,
     inlineButtons: import('../types.js').InlineButton[][],
+    requireMention: boolean,
   ): Promise<SendResult> {
     if (!this.restClient) {
       return { ok: false, error: 'Feishu client not initialized' };
@@ -916,7 +929,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     if (permId) {
       // Use real card action buttons
-      const cardJson = buildPermissionButtonCard(mdText, permId, chatId);
+      const cardJson = buildPermissionButtonCard(mdText, permId, chatId, requireMention);
 
       try {
         const res = await this.restClient.im.message.create({
@@ -1238,6 +1251,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       channelType: 'feishu' as const,
       chatId,
       userId,
+      isGroup,
     };
 
     // [P1] Check for /perm text command (permission approval fallback)

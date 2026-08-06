@@ -141,11 +141,17 @@ export interface PendingQuestionRecord {
   questionRequestId: string;
   channelType: string;
   chatId: string;
+  /** Persisted inbound conversation kind; absent only on legacy records. */
+  isGroup?: boolean;
   sessionId: string;
   questions: AskQuestion[];
   answers: Record<string, string>;
   state: PendingQuestionState;
   generation: string;
+  /** Number of card reissues already attempted after daemon restart. */
+  reissueCount?: number;
+  /** Number of text-fallback reposts already attempted after daemon restart. */
+  fallbackReissueCount?: number;
   messageId?: string;
   replyToMessageId?: string;
   createdAt: string;
@@ -235,6 +241,10 @@ export interface BridgeStore {
   savePendingQuestion?(record: PendingQuestionRecord): void;
   getPendingQuestion?(questionRequestId: string): PendingQuestionRecord | null;
   listPendingQuestions?(): PendingQuestionRecord[];
+  /**
+   * Atomically compare the current state and merge every supplied update field
+   * into the durable record. Hosts must round-trip optional lifecycle counters.
+   */
   transitionPendingQuestion?(
     questionRequestId: string,
     expectedStates: PendingQuestionState[],

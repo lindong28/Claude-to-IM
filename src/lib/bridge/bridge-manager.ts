@@ -499,9 +499,12 @@ async function handleMessage(
       msg.callbackFormValue || {},
     );
     if (questionResult.handled) {
+      const callbackAddress = questionResult.isGroup === undefined
+        ? msg.address
+        : { ...msg.address, isGroup: questionResult.isGroup };
       if (!questionResult.accepted) {
         await deliver(adapter, {
-          address: msg.address,
+          address: callbackAddress,
           text: questionResult.error || 'Question response rejected.',
           parseMode: 'plain',
         });
@@ -510,7 +513,7 @@ async function handleMessage(
       }
       if (!questionResult.resumePrompt) {
         await deliver(adapter, {
-          address: msg.address,
+          address: callbackAddress,
           text: 'Question answers recorded.',
           parseMode: 'plain',
         });
@@ -523,7 +526,9 @@ async function handleMessage(
       // callbacks and same-session turns stay serialized.
       dispatchSessionMessage(adapter, {
         ...msg,
+        address: callbackAddress,
         callbackData: undefined,
+        skipQuestionFallback: true,
         text: questionResult.resumePrompt,
       });
       return;
@@ -575,8 +580,8 @@ async function handleMessage(
     return;
   }
 
-  if (!msg.callbackData && !rawText.startsWith('/')) {
-    const fallbackResult = questionBroker.handleFallbackAnswer(msg.address.chatId, rawText);
+  if (!msg.callbackData && !msg.skipQuestionFallback && !rawText.startsWith('/')) {
+    const fallbackResult = questionBroker.handleFallbackAnswer(msg.address, rawText);
     if (fallbackResult.handled) {
       if (!fallbackResult.accepted || !fallbackResult.resumePrompt) {
         await deliver(adapter, {
@@ -831,14 +836,25 @@ async function handleMessage(
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       if (perm.toolName === 'AskUserQuestion') {
-        await questionBroker.forwardQuestionRequest(
-          adapter,
-          msg.address,
-          perm.permissionRequestId,
-          perm.toolInput.questions,
-          binding.codepilotSessionId,
-          msg.messageId,
-        );
+        try {
+          await questionBroker.forwardQuestionRequest(
+            adapter,
+            msg.address,
+            perm.permissionRequestId,
+            perm.toolInput.questions,
+            binding.codepilotSessionId,
+            msg.messageId,
+          );
+        } catch {
+          console.error('[bridge-manager] Failed to forward interactive question');
+          await questionBroker.failQuestionDelivery(
+            adapter,
+            msg.address,
+            perm.permissionRequestId,
+            msg.messageId,
+            binding.codepilotSessionId,
+          );
+        }
       } else {
         await broker.forwardPermissionRequest(
           adapter,
@@ -1020,7 +1036,7 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
-        '/stop - Stop current session',
+        '/stop - Stop current task and close pending questions',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
       ].join('\n');
@@ -1137,9 +1153,19 @@ async function handleCommand(
       if (taskAbort) {
         taskAbort.abort();
         st.activeTasks.delete(binding.codepilotSessionId);
-        response = 'Stopping current task...';
+      }
+      const questionRelease = await questionBroker.closePendingQuestionsForChat(adapter, msg.address);
+      const releaseText = formatQuestionRelease(questionRelease.released);
+      if (questionRelease.remaining > 0) {
+        response = `${taskAbort ? 'Stopping current task. ' : ''}${releaseText} Could not close ${questionRelease.remaining} pending question${questionRelease.remaining === 1 ? '' : 's'}; do not answer old cards, and restart the bridge before sending new work.`;
+      } else if (questionRelease.transitioned > 0) {
+        response = `${taskAbort ? 'Stopping current task. ' : ''}Closed ${questionRelease.transitioned} pending question${questionRelease.transitioned === 1 ? '' : 's'}. ${releaseText} Your next message starts new work.`;
+      } else if (questionRelease.found > 0 || questionRelease.released > 0) {
+        response = `${taskAbort ? 'Stopping current task. ' : ''}${releaseText} No pending questions remain; your next message starts new work.`;
+      } else if (taskAbort) {
+        response = 'Stopping current task. No pending questions remain; your next message starts new work.';
       } else {
-        response = 'No task is currently running.';
+        response = 'No task is currently running, and no pending question wait was released.';
       }
       break;
     }
@@ -1193,7 +1219,7 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
-        '/stop - Stop current session',
+        '/stop - Stop current task and close pending questions',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
@@ -1212,6 +1238,11 @@ async function handleCommand(
       replyToMessageId: msg.messageId,
     });
   }
+}
+
+function formatQuestionRelease(released: number): string {
+  if (released === 0) return 'No live provider wait was released.';
+  return `Released ${released} live question wait${released === 1 ? '' : 's'}.`;
 }
 
 function splitSetting(value: string | null): string[] {

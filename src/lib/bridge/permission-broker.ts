@@ -169,13 +169,18 @@ export async function forwardPermissionRequest(
       console.warn(
         `[permission-broker] Formatted permission prompt failed; retrying as plain text: ${result.error || 'unknown error'}`,
       );
+      const requireMention = adapter.channelType === 'feishu'
+        && address.isGroup === true
+        && store.getSetting('bridge_feishu_require_mention') !== 'false';
       const renderPlainFallback = (input: string) => [
         'Permission Required',
         '',
         `Tool: ${toolName}`,
         input,
         '',
-        'Reply with one of these commands:',
+        requireMention
+          ? 'Mention the bot, then reply with one of these commands:'
+          : 'Reply with one of these commands:',
         `/perm allow ${permissionRequestId}`,
         `/perm allow_session ${permissionRequestId}`,
         `/perm deny ${permissionRequestId}`,

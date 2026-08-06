@@ -24,6 +24,7 @@ export interface ChannelAddress {
   chatId: string;        // Platform-specific chat/channel identifier
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
+  isGroup?: boolean;     // Authoritative conversation kind when the inbound source provides it
 }
 
 /** Composite key for routing: channelType + chatId */
@@ -50,6 +51,8 @@ export interface InboundMessage {
   callbackMessageId?: string;
   /** Form values submitted by an interactive card action. */
   callbackFormValue?: Record<string, unknown>;
+  /** Internal synthetic resume; must not be reinterpreted as a text fallback answer. */
+  skipQuestionFallback?: boolean;
   /** Platform-specific raw update object (for adapter-specific handling) */
   raw?: unknown;
   /** Adapter-specific update ID for deferred offset acknowledgement */
