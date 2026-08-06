@@ -10,7 +10,10 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import { handlePermissionCallback } from '../../lib/bridge/permission-broker';
+import { forwardPermissionRequest, handlePermissionCallback } from '../../lib/bridge/permission-broker';
+import { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
+import { PLATFORM_LIMITS } from '../../lib/bridge/types';
+import type { ChannelType, OutboundMessage, SendResult } from '../../lib/bridge/types';
 import type { BridgeStore, PermissionGateway, PermissionResolution } from '../../lib/bridge/host';
 
 // ── Mock Store ──────────────────────────────────────────────
@@ -20,7 +23,7 @@ function createMockStore() {
 
   return {
     links,
-    getSetting: () => null,
+    getSetting: (_key?: string): string | null => null,
     getChannelBinding: () => null,
     upsertChannelBinding: () => ({} as any),
     updateChannelBinding: () => {},
@@ -200,5 +203,168 @@ describe('permission-broker', () => {
     assert.ok(result);
     assert.equal(gateway.resolved[0].resolution.behavior, 'allow');
     assert.ok((gateway.resolved[0].resolution as any).updatedPermissions);
+  });
+
+  it('redacts approval input, preserves realistic commands, and marks oversized input', async () => {
+    class CapturingAdapter extends BaseChannelAdapter {
+      readonly channelType = 'feishu' as const;
+      sent: OutboundMessage[] = [];
+      async start() {}
+      async stop() {}
+      isRunning() { return true; }
+      async consumeOne() { return null; }
+      async send(message: OutboundMessage): Promise<SendResult> {
+        this.sent.push(message);
+        return { ok: true, messageId: 'permission-message' };
+      }
+      validateConfig() { return null; }
+      isAuthorized() { return true; }
+    }
+    const adapter = new CapturingAdapter();
+    const secret = 'permission-secret-canary';
+    store.getSetting = (key?: string) => key === 'bridge_feishu_app_secret' ? secret : null;
+    setupContext(store, gateway);
+    const exactCommand = `printf ${'x'.repeat(420)} ${secret}`;
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-1', userId: 'user-1' },
+      'permission-long-input',
+      'Bash',
+      { command: exactCommand },
+    );
+
+    assert.equal(adapter.sent.length, 1);
+    assert.match(adapter.sent[0].text, /Tool: <code>Bash<\/code>/);
+    assert.match(adapter.sent[0].text, new RegExp(`printf x{420} \\[REDACTED\\]`));
+    assert.equal(adapter.sent[0].text.includes(secret), false);
+    assert.doesNotMatch(adapter.sent[0].text, /TRUNCATED/);
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-2', userId: 'user-1' },
+      'permission-oversized-input',
+      'Bash',
+      { command: 'x'.repeat(50_000) },
+    );
+
+    assert.equal(adapter.sent.length, 2);
+    assert.match(adapter.sent[1].text, /TRUNCATED.*fit.*feishu/i);
+    assert.ok(adapter.sent[1].text.length <= 30_000);
+  });
+
+  it('keeps an oversized approval prompt atomic and within every channel limit', async () => {
+    class CapturingAdapter extends BaseChannelAdapter {
+      sent: OutboundMessage[] = [];
+      constructor(readonly channelType: ChannelType) { super(); }
+      async start() {}
+      async stop() {}
+      isRunning() { return true; }
+      async consumeOne() { return null; }
+      async send(message: OutboundMessage): Promise<SendResult> {
+        this.sent.push(message);
+        return { ok: true, messageId: `${this.channelType}-permission-message` };
+      }
+      validateConfig() { return null; }
+      isAuthorized() { return true; }
+    }
+
+    for (const channelType of ['telegram', 'discord', 'slack', 'feishu', 'qq', 'weixin'] as const) {
+      const adapter = new CapturingAdapter(channelType);
+      await forwardPermissionRequest(
+        adapter,
+        { channelType, chatId: `chat-${channelType}`, userId: 'user-1' },
+        `permission-atomic-${channelType}`,
+        'Bash',
+        { command: `printf '${'\"<&'.repeat(6_000)}'` },
+      );
+
+      assert.equal(adapter.sent.length, 1, `${channelType} approval must be one message`);
+      const message = adapter.sent[0];
+      assert.ok(message.text.length <= PLATFORM_LIMITS[channelType], channelType);
+      assert.match(message.text, /TRUNCATED.*fit/i, channelType);
+      if (message.parseMode === 'HTML') {
+        assert.equal((message.text.match(/<pre>/g) || []).length, 1, channelType);
+        assert.equal((message.text.match(/<\/pre>/g) || []).length, 1, channelType);
+        assert.equal(message.inlineButtons?.length, 1, channelType);
+      }
+    }
+  });
+
+  it('redacts secrets that require JSON escaping before rendering approval input', async () => {
+    class CapturingAdapter extends BaseChannelAdapter {
+      readonly channelType = 'feishu' as const;
+      sent: OutboundMessage[] = [];
+      async start() {}
+      async stop() {}
+      isRunning() { return true; }
+      async consumeOne() { return null; }
+      async send(message: OutboundMessage): Promise<SendResult> {
+        this.sent.push(message);
+        return { ok: true, messageId: 'permission-message' };
+      }
+      validateConfig() { return null; }
+      isAuthorized() { return true; }
+    }
+    const adapter = new CapturingAdapter();
+    const secret = 'secret-with-"quote\\slash';
+    store.getSetting = (key?: string) => key === 'bridge_feishu_app_secret' ? secret : null;
+    setupContext(store, gateway);
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-json-secret', userId: 'user-1' },
+      'permission-json-secret',
+      'Bash',
+      { command: `printf %s '${secret}'` },
+    );
+
+    const rendered = adapter.sent[0].text;
+    assert.doesNotMatch(rendered, /secret-with-/);
+    assert.match(rendered, /\[REDACTED\]/);
+  });
+
+  it('retries a rejected formatted approval as one plain message and logs the cause', async () => {
+    class FallbackAdapter extends BaseChannelAdapter {
+      readonly channelType = 'telegram' as const;
+      sent: OutboundMessage[] = [];
+      async start() {}
+      async stop() {}
+      isRunning() { return true; }
+      async consumeOne() { return null; }
+      async send(message: OutboundMessage): Promise<SendResult> {
+        this.sent.push(message);
+        if (this.sent.length === 1) {
+          return { ok: false, error: 'formatted approval rejected', httpStatus: 400 } as SendResult;
+        }
+        return { ok: true, messageId: 'plain-fallback-message' };
+      }
+      validateConfig() { return null; }
+      isAuthorized() { return true; }
+    }
+    const adapter = new FallbackAdapter();
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+    try {
+      await forwardPermissionRequest(
+        adapter,
+        { channelType: 'telegram', chatId: 'chat-fallback', userId: 'user-1' },
+        'permission-delivery-fallback',
+        'Bash',
+        { command: 'printf safe' },
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(adapter.sent.length, 2);
+    assert.equal(adapter.sent[1].parseMode, 'plain');
+    assert.equal(adapter.sent[1].inlineButtons, undefined);
+    assert.match(adapter.sent[1].text, /\/perm allow permission-delivery-fallback/);
+    assert.match(adapter.sent[1].text, /\/perm allow_session permission-delivery-fallback/);
+    assert.match(adapter.sent[1].text, /\/perm deny permission-delivery-fallback/);
+    assert.ok(adapter.sent[1].text.length <= PLATFORM_LIMITS.telegram);
+    assert.equal(warnings.filter((line) => line.includes('formatted approval rejected')).length, 1);
   });
 });

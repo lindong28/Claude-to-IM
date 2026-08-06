@@ -221,6 +221,21 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
 
 function dispatchSessionMessage(adapter: BaseChannelAdapter, msg: InboundMessage): void {
   const binding = router.resolve(msg.address);
+  const state = getState();
+  if (adapter.channelType === 'feishu' && state.sessionLocks.has(binding.codepilotSessionId)) {
+    void deliver(adapter, {
+      address: msg.address,
+      text: 'Task queued.',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    }).then((result) => {
+      if (!result.ok) {
+        console.warn(`[bridge-manager] Queue acknowledgement delivery failed: ${result.error || 'unknown error'}`);
+      }
+    }).catch((err: unknown) => {
+      console.warn('[bridge-manager] Queue acknowledgement delivery failed:', err instanceof Error ? err.message : err);
+    });
+  }
   processWithSessionLock(binding.codepilotSessionId, () =>
     handleMessage(adapter, msg),
   ).catch(err => {
@@ -693,6 +708,21 @@ async function handleMessage(
     }
   }
 
+  // Long-running group tasks always have a visible beginning and end. This
+  // acknowledgement is independent of CardKit so card degradation cannot make
+  // the task appear ignored.
+  if (adapter.channelType === 'feishu') {
+    const startResult = await deliver(adapter, {
+      address: msg.address,
+      text: 'Task started.',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    if (!startResult.ok) {
+      console.warn(`[bridge-manager] Start acknowledgement delivery failed: ${startResult.error || 'unknown error'}`);
+    }
+  }
+
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
 
@@ -762,7 +792,7 @@ async function handleMessage(
     flushPreview(adapter, ps, cfg);
   } : undefined;
 
-  // ── Streaming card setup (Feishu CardKit v2) ──────────────────
+  // ── Streaming card setup (Feishu CardKit v1) ──────────────────
   // If the adapter supports streaming cards (e.g. Feishu), wire up
   // onStreamText, onToolEvent, and onStreamEnd callbacks.
   // These run in parallel with the existing preview system — Feishu
@@ -864,10 +894,13 @@ async function handleMessage(
     // onStreamEnd awaits any in-flight card creation and returns true if a card
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
+    let cardContentVisible = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
       try {
         const status = result.hasError || recoveryPersistenceFailed ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, responseText);
+        const cardResult = await adapter.onStreamEnd(msg.address.chatId, status, responseText);
+        cardFinalized = cardResult === true;
+        cardContentVisible = cardResult === 'content-visible';
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
       }
@@ -877,7 +910,18 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, responseText, binding.codepilotSessionId, msg.messageId);
+        const completionResult = await deliverResponse(
+          adapter,
+          msg.address,
+          cardContentVisible
+            ? 'Task completed. The reply above may be missing its final formatting.'
+            : responseText,
+          binding.codepilotSessionId,
+          msg.messageId,
+        );
+        if (!completionResult.ok) {
+          console.warn(`[bridge-manager] Completion reply delivery failed: ${completionResult.error || 'unknown error'}`);
+        }
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -1210,4 +1254,4 @@ export function computeSdkSessionUpdate(
 // Exposed so integration tests can exercise handleMessage directly
 // without wiring up the full adapter loop.
 /** @internal */
-export const _testOnly = { handleMessage };
+export const _testOnly = { handleMessage, dispatchSessionMessage };

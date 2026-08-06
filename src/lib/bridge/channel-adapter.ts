@@ -103,7 +103,7 @@ export abstract class BaseChannelAdapter {
   /**
    * Called on each text SSE event during streaming. Adapter can use this
    * to update a streaming card in real-time. Only called for adapters
-   * that support streaming cards (e.g. Feishu CardKit v2).
+   * that support streaming cards (e.g. Feishu CardKit v1).
    */
   onStreamText?(_chatId: string, _fullText: string): void;
 
@@ -116,9 +116,14 @@ export abstract class BaseChannelAdapter {
   /**
    * Called when streaming ends. Adapter should finalize the streaming card
    * (close streaming mode, add footer, etc.).
-   * Returns true if a card was finalized (caller should skip normal delivery).
+   * Returns true if a card was finalized (caller should skip normal delivery),
+   * or `content-visible` when the full answer is visible but final status update failed.
    */
-  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+  onStreamEnd?(
+    _chatId: string,
+    _status: 'completed' | 'interrupted' | 'error',
+    _responseText: string,
+  ): Promise<boolean | 'content-visible'>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

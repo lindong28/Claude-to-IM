@@ -10,11 +10,55 @@
  */
 
 import type { PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
-import type { ChannelAddress, OutboundMessage } from './types.js';
+import { PLATFORM_LIMITS } from './types.js';
+import type { ChannelAddress, ChannelType, OutboundMessage } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
+import { knownOutboundSecrets, redactLiterals } from './security/outbound-redaction.js';
+
+function serializePermissionInput(toolInput: Record<string, unknown>, secrets: readonly string[]): string {
+  const serialized = JSON.stringify(toolInput, null, 2);
+  const serializedSecrets = secrets.map((secret) => JSON.stringify(secret).slice(1, -1));
+  return redactLiterals(serialized, [...secrets, ...serializedSecrets]);
+}
+
+function codePointPrefix(value: string, count: number): string {
+  return Array.from(value).slice(0, count).join('');
+}
+
+function fitPermissionInput(
+  serializedInput: string,
+  channelType: ChannelType,
+  renderMessage: (input: string) => string,
+): { input: string; message: string } {
+  const limit = PLATFORM_LIMITS[channelType] || 4096;
+  const complete = renderMessage(serializedInput);
+  if (complete.length <= limit) return { input: serializedInput, message: complete };
+
+  const marker = `[TRUNCATED: approval input shortened to fit ${channelType} message limit]`;
+  const codePoints = Array.from(serializedInput);
+  let low = 0;
+  let high = codePoints.length;
+  let best = marker;
+  let bestMessage = renderMessage(best);
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = `${codePointPrefix(serializedInput, mid)}\n${marker}`;
+    const rendered = renderMessage(candidate);
+    if (rendered.length <= limit) {
+      best = candidate;
+      bestMessage = rendered;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return { input: best, message: bestMessage };
+}
 
 /**
  * Dedup recent permission forwards to prevent duplicate cards.
@@ -51,33 +95,32 @@ export async function forwardPermissionRequest(
 
   console.log(`[permission-broker] Forwarding permission request: ${permissionRequestId} tool=${toolName} channel=${adapter.channelType}`);
 
-  // Format the input summary (truncated)
-  const inputStr = JSON.stringify(toolInput, null, 2);
-  const truncatedInput = inputStr.length > 300
-    ? inputStr.slice(0, 300) + '...'
-    : inputStr;
+  // Redact before bounding so truncation cannot expose a secret prefix. The
+  // delivery layer repeats literal redaction at the unified outbound exit.
+  const serializedInput = serializePermissionInput(toolInput, knownOutboundSecrets(store));
 
   let result: import('./types.js').SendResult;
 
   if (adapter.channelType === 'qq' || adapter.channelType === 'weixin') {
     const channelLabel = adapter.channelType === 'weixin' ? 'WeChat' : 'QQ';
     // QQ / WeChat: plain text permission prompt with copyable /perm commands (no inline buttons)
-    const plainText = [
-      `Permission Required`,
-      ``,
-      `Tool: ${toolName}`,
-      truncatedInput,
-      ``,
-      `Reply:`,
-      `1 - Allow once`,
-      `2 - Allow session`,
-      `3 - Deny`,
-      ``,
-      `Or use full command:`,
-      `/perm allow ${permissionRequestId}`,
-      `/perm allow_session ${permissionRequestId}`,
-      `/perm deny ${permissionRequestId}`,
-    ].join('\n');
+    const renderPlainText = (input: string) => [
+        `Permission Required`,
+        ``,
+        `Tool: ${toolName}`,
+        input,
+        ``,
+        `Reply:`,
+        `1 - Allow once`,
+        `2 - Allow session`,
+        `3 - Deny`,
+        ``,
+        `Or use full command:`,
+        `/perm allow ${permissionRequestId}`,
+        `/perm allow_session ${permissionRequestId}`,
+        `/perm deny ${permissionRequestId}`,
+      ].join('\n');
+    const { message: plainText } = fitPermissionInput(serializedInput, adapter.channelType, renderPlainText);
 
     const plainMessage: OutboundMessage = {
       address,
@@ -87,18 +130,25 @@ export async function forwardPermissionRequest(
     };
 
     result = await deliver(adapter, plainMessage, { sessionId });
-    console.log(
-      `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
-    );
+    if (result.ok) {
+      console.log(
+        `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
+      );
+    }
   } else {
-    const text = [
+    const renderHtmlText = (input: string) => [
       `<b>Permission Required</b>`,
       ``,
       `Tool: <code>${escapeHtml(toolName)}</code>`,
-      `<pre>${escapeHtml(truncatedInput)}</pre>`,
+      `<pre>${escapeHtml(input)}</pre>`,
       ``,
       `Choose an action:`,
     ].join('\n');
+    const { input: fittedInput, message: text } = fitPermissionInput(
+      serializedInput,
+      adapter.channelType,
+      renderHtmlText,
+    );
 
     const message: OutboundMessage = {
       address,
@@ -115,6 +165,35 @@ export async function forwardPermissionRequest(
     };
 
     result = await deliver(adapter, message, { sessionId });
+    if (!result.ok) {
+      console.warn(
+        `[permission-broker] Formatted permission prompt failed; retrying as plain text: ${result.error || 'unknown error'}`,
+      );
+      const renderPlainFallback = (input: string) => [
+        'Permission Required',
+        '',
+        `Tool: ${toolName}`,
+        input,
+        '',
+        'Reply with one of these commands:',
+        `/perm allow ${permissionRequestId}`,
+        `/perm allow_session ${permissionRequestId}`,
+        `/perm deny ${permissionRequestId}`,
+      ].join('\n');
+      const fallback = fitPermissionInput(fittedInput, adapter.channelType, renderPlainFallback);
+      result = await deliver(adapter, {
+        ...message,
+        text: fallback.message,
+        parseMode: 'plain',
+        inlineButtons: undefined,
+      }, { sessionId });
+    }
+  }
+
+  if (!result.ok) {
+    console.error(
+      `[permission-broker] Permission prompt delivery failed for ${permissionRequestId}: ${result.error || 'unknown error'}`,
+    );
   }
 
   // Record the link so we can match callback queries back to this permission

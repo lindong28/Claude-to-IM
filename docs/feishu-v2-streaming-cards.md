@@ -1,18 +1,17 @@
 # 飞书 V2 — 流式卡片 + 权限按钮
 
-> 状态：**待开始**
+> 状态：**已实现；CardKit v1 兼容与文本降级已修正**
 > 目标：将 CodePilot 飞书 V2 的核心能力移植到 claude-to-im 开源库
 
 ## 背景
 
-CodePilot 已实现飞书 V2：CardKit v2 流式卡片、工具进度、权限内联按钮、Thinking 状态、Footer 耗时。
-claude-to-im 当前飞书实现：无流式（发最终结果）、权限靠文本命令 `/perm`、无工具进度显示。
+CodePilot 与 claude-to-im 均已实现 CardKit 流式卡片、工具进度、权限内联按钮、Thinking 状态和 Footer 耗时；claude-to-im 的 CardKit 路径使用已安装 SDK 暴露的 v1 API，并在卡片不可用时降级为普通消息。
 
 ## 目标能力
 
 | 能力 | 说明 |
 |------|------|
-| 流式卡片 | CardKit v2 create → streamContent → finalize，实时显示生成过程 |
+| 流式卡片 | CardKit v1 create → cardElement.content → finalize，实时显示生成过程 |
 | 工具进度 | 🔄 Running / ✅ Complete / ❌ Error 实时渲染 |
 | 权限按钮 | card.action.trigger 内联按钮替代文本命令 |
 | Thinking 状态 | 文本到达前显示 💭 Thinking... |
@@ -20,21 +19,21 @@ claude-to-im 当前飞书实现：无流式（发最终结果）、权限靠文�
 
 ## 架构决策
 
-### D1: CardKit v2 REST API vs im.message.patch
+### D1: CardKit v1 REST API vs im.message.patch
 
-**选择：CardKit v2 REST API**
+**选择：已安装 Lark SDK 暴露的 CardKit v1 REST API**
 
 理由：
 - `im.message.patch` 有频率限制且不支持真正的流式模式
-- CardKit v2 提供 `streaming_mode`、`streamContent`、`setStreamingMode` 原生流式 API
+- `@larksuiteoapi/node-sdk@1.59.0` 只暴露 `cardkit.v1`；流式内容通过 `cardElement.content` 更新，设置通过 `card.settings` 关闭
 - 与 CodePilot 方案一致，已验证可行
 
 API 调用序列：
-1. `POST /cardkit/v2/cards` — 创建卡片（streaming_mode: true）
+1. `POST /cardkit/v1/cards` — 创建卡片（streaming_mode: true）
 2. `POST /im/v1/messages` — 发送卡片消息（content: `{type:"card", data:{card_id}}` ）
-3. `PATCH /cardkit/v2/cards/{card_id}/elements/{element_id}` 或 `streamContent` — 更新内容
-4. `PUT /cardkit/v2/cards/{card_id}/settings/streaming_mode` — 关闭流式
-5. `PUT /cardkit/v2/cards/{card_id}` — 最终更新（footer、工具进度定稿）
+3. `PUT /cardkit/v1/cards/{card_id}/elements/{element_id}/content` — 更新内容
+4. `PATCH /cardkit/v1/cards/{card_id}/settings` — 关闭流式
+5. `PUT /cardkit/v1/cards/{card_id}` — 最终更新（footer、工具进度定稿）
 
 ### D2: card.action.trigger 接收方式
 
@@ -76,7 +75,7 @@ API 调用序列：
 **新增：**
 - `FeishuCardState` 接口 — 每条流式回复的卡片状态（cardId, messageId, sequence, startTime, toolCalls, thinking, pendingText, throttleTimer）
 - `activeCards: Map<string, FeishuCardState>` — 按 chatId 索引的活跃卡片
-- `createStreamingCard(chatId, replyToMessageId?)` — 创建 CardKit v2 卡片 + 发送消息
+- `createStreamingCard(chatId, replyToMessageId?)` — 创建 CardKit v1 卡片 + 发送消息
 - `updateCardContent(chatId, text)` — 节流更新卡片内容（~200ms）
 - `updateToolProgress(chatId, tools: ToolCallInfo[])` — 更新工具进度（合入卡片内容）
 - `finalizeCard(chatId, status, responseText)` — 关闭流式模式、最终更新（含 footer）
@@ -96,7 +95,7 @@ API 调用序列：
 // 通过 BaseChannelAdapter 的可选方法或直接类型断言调用
 onStreamText?(chatId: string, fullText: string): void;
 onToolEvent?(chatId: string, tools: ToolCallInfo[]): void;
-onStreamEnd?(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): void;
+onStreamEnd?(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean | 'content-visible'>;
 ```
 
 #### 2. `src/lib/bridge/markdown/feishu.ts` — 扩展
@@ -184,7 +183,7 @@ onStreamEnd?(chatId: string, status: 'completed' | 'interrupted' | 'error', resp
 
 | 风险 | 缓解 |
 |------|------|
-| CardKit v2 API 需要额外权限 | 文档中明确列出，升级指南提供 scope 列表 |
+| CardKit API 需要额外权限 | 文档中明确列出，升级指南提供 scope 列表 |
 | monkey-patch 在 SDK 升级后失效 | 添加 try-catch + 降级到文本命令 |
 | 卡片创建失败（权限不足） | fallback 到 send() 的传统路径（post/card） |
 | 流式更新频率过高被限流 | 200ms 节流 + trailing-edge flush |
